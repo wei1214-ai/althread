@@ -17,9 +17,6 @@ import kotlinx.serialization.Serializable
 import java.io.File
 import java.util.UUID
 
-/**
- * Data model for post comments mapped to Supabase columns.
- */
 @Serializable
 data class PostComment(
     val id: String = "",
@@ -31,17 +28,11 @@ data class PostComment(
     @SerialName("created_at") val createdAt: String? = null
 )
 
-/**
- * Helper lightweight data model to query post ID references.
- */
 @Serializable
 private data class SimplePostIdRow(
     @SerialName("post_id") val postId: String
 )
 
-/**
- * Data payload model used for inserting new posts into Supabase.
- */
 @Serializable
 private data class NewPost(
     @SerialName("user_id")
@@ -52,11 +43,10 @@ private data class NewPost(
     @SerialName("user_profile_pic_url")
     val userProfilePicUrl: String?,
 
-    // Primary single image/video URL maintained for backward compatibility
+    // Retained for compatibility with clients that support one media URL.
     @SerialName("media_url")
     val mediaUrl: String,
 
-    // List of media URLs supporting multi-photo/media posts
     @SerialName("media_urls")
     val mediaUrls: List<String> = emptyList(),
 
@@ -84,29 +74,13 @@ private data class NewPost(
     val challengePostId: String? = null
 )
 
-/**
- * Repository responsible for managing post data operations with Supabase.
- */
 class PostRepository {
 
-    /**
-     * Helper to safely retrieve the currently authenticated user's ID.
-     */
     private fun getCurrentUserId(): String? {
         return supabase.auth.currentUserOrNull()?.id
     }
 
-    /**
-     * Fetches post records filtered by category and sorted by preference.
-     * Maps user specific states like likes and favorites.
-     * Returns emptyList() on error — never fake sample data (caller shows error/empty state).
-     *
-     * Tab rule (post_type is the source of truth, NOT clothing_category):
-     * - "Challenge" tab -> only post_type == "Challenge".
-     * - Style tabs (Trend/Vintage/Streetwear) -> matching category AND
-     *   post_type != "Challenge" (challenge posts live ONLY in Challenge).
-     * - "For You"/"All" -> everything (challenges stay visible in the main feed).
-     */
+    /** Returns posts for the selected feed category and sort order. */
     suspend fun getPosts(
         category: String = "All",
         sortBy: String = "latest",
@@ -149,14 +123,11 @@ class PostRepository {
         }
     }
 
-    /**
-     * Searches posts using caption keywords and returns sorted results.
-     * Escapes LIKE wildcards so "%" can't full-scan; caps length + page size.
-     */
+    /** Searches captions using a bounded, literal query. */
     suspend fun searchPosts(query: String, sortBy: String = "latest", limit: Int = 30): List<Post> = withContext(Dispatchers.IO) {
         val clean = query.trim().take(30)
         if (clean.isBlank()) return@withContext getPosts(category = "All", sortBy = sortBy, limit = limit)
-        // Escape \, % _ so user input is literal inside ilike
+        // Escape SQL LIKE metacharacters so the query remains literal.
         val escaped = clean
             .replace("\\", "\\\\")
             .replace("%", "\\%")
@@ -192,11 +163,7 @@ class PostRepository {
         }
     }
 
-    /**
-     * Retrieves posts favorited by the current user.
-     * Fetches only favorited ids first, then loads those posts directly
-     * (no full-table pull + memory filter).
-     */
+    /** Returns the current user's saved posts. */
     suspend fun getFavouritePosts(limit: Int = 30): List<Post> = withContext(Dispatchers.IO) {
         try {
             val favoritedPostIds = getFavoritedPostIdsForCurrentUser()
@@ -214,9 +181,6 @@ class PostRepository {
         }
     }
 
-    /**
-     * Counts total number of posts created by a specific user.
-     */
     suspend fun getPostCount(userId: String): Int = withContext(Dispatchers.IO) {
         try {
             supabase.from("posts")
@@ -232,11 +196,7 @@ class PostRepository {
         }
     }
 
-    /**
-     * Deletes a post record and its associated interactions (likes, comments, favorites) from Supabase.
-     * Scoped to owner: refuses to delete others' posts client-side (RLS must also enforce).
-     * Also removes orphan Storage files.
-     */
+    /** Deletes an owned post, its related records, and associated media. */
     suspend fun deletePost(postId: String): Boolean = withContext(Dispatchers.IO) {
         try {
             val userId = getCurrentUserId() ?: error("Please log in first.")
@@ -244,7 +204,7 @@ class PostRepository {
             if (target.userId.isNotBlank() && target.userId != userId) {
                 error("You can only delete your own posts.")
             }
-            // Delete child rows first to preserve referential integrity.
+            // Remove dependent rows before deleting the post.
             supabase.from("post_likes").delete {
                 filter { eq("post_id", postId) }
             }
@@ -255,7 +215,6 @@ class PostRepository {
                 filter { eq("post_id", postId) }
             }
 
-            // Delete the post row itself, owner-scoped (also enforced by RLS).
             supabase.from("posts").delete {
                 filter {
                     eq("id", postId)
@@ -263,7 +222,7 @@ class PostRepository {
                 }
             }
 
-            // Remove uploaded files so deleted posts leave no orphan objects; failures are ignored.
+            // Storage cleanup is best effort; database deletion has already succeeded.
             runCatching {
                 val paths = target.allMediaUrls.mapNotNull { urlToClothPath(it) }
                 if (paths.isNotEmpty()) supabase.storage.from("cloth").delete(paths)
@@ -277,7 +236,6 @@ class PostRepository {
     }
 
     private fun urlToClothPath(url: String): String? {
-        // publicUrl = .../storage/v1/object/public/cloth/<path>
         val marker = "/cloth/"
         val idx = url.indexOf(marker)
         if (idx < 0) return null
@@ -285,10 +243,7 @@ class PostRepository {
             .takeIf { it.isNotBlank() }
     }
 
-    /**
-     * Helper function that dynamically checks media type (video/image) and uploads to Supabase storage.
-     * Returns (publicUrl, isVideo, storagePath) so caller can roll back on failure.
-     */
+    /** Uploads media and returns its public URL, media type, and storage path. */
     private suspend fun uploadSingleMedia(
         context: Context,
         uri: Uri,
@@ -312,7 +267,6 @@ class PostRepository {
         val sizeLimit = if (isVideo) 100L * 1024 * 1024 else 15L * 1024 * 1024
         val mediaBytes = context.contentResolver.openInputStream(uri)
             ?.use { stream ->
-                // Guard size without loading unbounded: read with cap
                 val bytes = stream.readBytes()
                 if (bytes.size > sizeLimit) error(
                     if (isVideo) "Video too large (max 100MB)." else "Image too large (max 15MB)."
@@ -323,16 +277,13 @@ class PostRepository {
 
         val mediaPath = "$userId/${UUID.randomUUID()}.$fileExtension"
         val bucket = supabase.storage.from("cloth")
-        // UploadOptionBuilder.contentType is ktor ContentType (not String) — parse it.
         bucket.upload(mediaPath, mediaBytes) { this.contentType = ContentType.parse(contentType) }
 
         val publicUrl = bucket.publicUrl(mediaPath)
         return@withContext Triple(publicUrl, isVideo, mediaPath)
     }
 
-    /**
-     * Uploads an already rendered local file (used for design front/back images).
-     */
+    /** Uploads a rendered design image. */
     private suspend fun uploadSingleFile(
         file: File,
         userId: String
@@ -351,10 +302,7 @@ class PostRepository {
         Pair(bucket.publicUrl(mediaPath), mediaPath)
     }
 
-    /**
-     * Uploads multiple selected media items concurrently and creates a new post entry in Supabase.
-     * Files passed in [mediaFiles] are uploaded first so they become the leading images of the post.
-     */
+    /** Uploads post media and creates the corresponding database record. */
     suspend fun createPost(
         context: Context,
         imageUris: List<Uri>,
@@ -376,9 +324,7 @@ class PostRepository {
                 ?: error("Please log in before posting.")
             val profile = ProfileRepository().getMyProfile()
 
-            // Rendered design images come first so they stay the main photos of the post
-            // Any upload or insert failure deletes every file uploaded so far,
-            // otherwise retries pile orphan files in the cloth bucket.
+            // Design renders precede selected media and therefore become primary images.
             val completedPaths = java.util.Collections.synchronizedList(mutableListOf<String>())
             try {
                 val fileUploads = mediaFiles.map { file ->
@@ -387,7 +333,6 @@ class PostRepository {
                     }
                 }.awaitAll()
 
-                // Concurrently upload selected media items.
                 val uploadResults = imageUris.map { uri ->
                     async {
                         uploadSingleMedia(context, uri, user.id).also { completedPaths.add(it.third) }
@@ -423,7 +368,7 @@ class PostRepository {
 
                 supabase.from("posts").insert(newPost)
             } catch (e: Exception) {
-                // Roll back uploaded Storage files on ANY failure (upload or DB insert)
+                // Prevent orphaned objects when any upload or insert fails.
                 runCatching {
                     val stale = completedPaths.toList()
                     if (stale.isNotEmpty()) supabase.storage.from("cloth").delete(stale)
@@ -438,9 +383,6 @@ class PostRepository {
         }
     }
 
-    /**
-     * Overloaded function for single image/video creation to maintain backward compatibility.
-     */
     suspend fun createPost(
         context: Context,
         imageUri: Uri,
@@ -460,10 +402,7 @@ class PostRepository {
         )
     }
 
-    /**
-     * Toggles the current user's row in post_likes. A Supabase trigger keeps the persisted
-     * posts.like_count value synchronized with that table.
-     */
+    /** Toggles the current user's like and returns the persisted count. */
     suspend fun toggleLike(postId: String): Int = withContext(Dispatchers.IO) {
         try {
             val userId = getCurrentUserId() ?: return@withContext -1
@@ -495,13 +434,13 @@ class PostRepository {
                         )
                     )
                 } catch (e: Exception) {
-                    // Concurrent double-tap can hit unique(post_id,user_id): treat as liked
+                    // A duplicate insert indicates a concurrent like request already succeeded.
                     val msg = (e.message ?: "").lowercase()
                     if (!msg.contains("duplicate") && !msg.contains("unique") && !msg.contains("409")) throw e
                 }
             }
 
-            // like_count is maintained by a DB trigger; re-read it fresh after the toggle.
+            // The database trigger maintains the count; read back its authoritative value.
             supabase.from("posts").select {
                 filter { eq("id", postId) }
             }.decodeList<Post>().firstOrNull()?.likeCount ?: -1
@@ -511,9 +450,6 @@ class PostRepository {
         }
     }
 
-    /**
-     * Fetches all comments associated with a specific post.
-     */
     suspend fun getComments(postId: String): List<PostComment> = withContext(Dispatchers.IO) {
         try {
             supabase.from("post_comments").select {
@@ -525,9 +461,6 @@ class PostRepository {
         }
     }
 
-    /**
-     * Adds a new comment to a specified post.
-     */
     suspend fun addComment(postId: String, content: String): Boolean = withContext(Dispatchers.IO) {
         try {
             val user = supabase.auth.currentUserOrNull()
@@ -558,10 +491,7 @@ class PostRepository {
         }
     }
 
-    /**
-     * Dynamically adds or removes a post from user favorites/bookmarks.
-     * Returns false when the write failed so the caller can roll back.
-     */
+    /** Adds or removes a post from the current user's saved items. */
     suspend fun toggleFavourite(postId: String, isSaved: Boolean): Boolean = withContext(Dispatchers.IO) {
         try {
             val userId = getCurrentUserId() ?: return@withContext false
@@ -584,9 +514,6 @@ class PostRepository {
         }
     }
 
-    /**
-     * Fetches a single post by id (used to show the challenge a design responds to).
-     */
     suspend fun getPostById(postId: String): Post? = withContext(Dispatchers.IO) {
         if (postId.isBlank()) return@withContext null
         try {
@@ -599,9 +526,6 @@ class PostRepository {
         }
     }
 
-    /**
-     * Helper to retrieve set of post IDs liked by current user.
-     */
     private suspend fun getLikedPostIdsForCurrentUser(): Set<String> = withContext(Dispatchers.IO) {
         try {
             val userId = getCurrentUserId() ?: return@withContext emptySet()
@@ -613,9 +537,6 @@ class PostRepository {
         }
     }
 
-    /**
-     * Helper to retrieve set of post IDs favorited by current user.
-     */
     private suspend fun getFavoritedPostIdsForCurrentUser(): Set<String> = withContext(Dispatchers.IO) {
         try {
             val userId = getCurrentUserId() ?: return@withContext emptySet()

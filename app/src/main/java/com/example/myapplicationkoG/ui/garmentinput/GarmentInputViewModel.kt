@@ -23,16 +23,7 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.UUID
 
-/**
- * State holder for [GarmentInputScreen].
- *
- * Flow per side (FRONT then BACK):
- *   1. Copy the picked Uri into app private storage (file:// is stable).
- *   2. Run on-device cloth U2NET → cutout bitmap.
- *   3. Save the cutout as a PNG so the next screen can pick it up.
- *
- * UI just shows the final cutout preview for each side.
- */
+/** Manages garment imports, cutouts, and editor state. */
 class GarmentInputViewModel(app: Application) : AndroidViewModel(app) {
 
     private val inference: ClothingInferencePipeline =
@@ -49,16 +40,10 @@ class GarmentInputViewModel(app: Application) : AndroidViewModel(app) {
     var openDesignName: String = ""
     var openDesignChallengePostId: String? = null
 
-    // Deferred deletion: back navigation must not delete the files the editor may
-    // still reopen, so paths are queued here and only removed once a new design
-    // loads successfully (or on explicit clear / logout). Guarded by synchronized
-    // because the UI thread and IO workers both touch it; drain under the lock,
-    // delete outside it so file IO never blocks a state update.
+    // Retain assets across back navigation; delete them after replacement or an explicit clear.
     private val pendingDeletionPaths = mutableListOf<String>()
 
-    // Challenge fields live in StateFlow so rotation cannot lose them; the
-    // ChallengeSession singleton is kept in lockstep for screens that still
-    // read it directly.
+    // State flows preserve challenge metadata across configuration changes.
     private val _challengePostId = MutableStateFlow<String?>(null)
     val challengePostIdFlow: StateFlow<String?> = _challengePostId.asStateFlow()
     var challengePostId: String?
@@ -79,7 +64,6 @@ class GarmentInputViewModel(app: Application) : AndroidViewModel(app) {
         _challengePostId.value = postId
         _challengeTitle.value = title
         _challengeDescription.value = description
-        // Also keep singleton in sync for screens that still read ChallengeSession directly
         com.example.myapplicationkoG.ui.editor.ChallengeSession.postId = postId
         com.example.myapplicationkoG.ui.editor.ChallengeSession.title = title
         com.example.myapplicationkoG.ui.editor.ChallengeSession.description = description
@@ -96,7 +80,7 @@ class GarmentInputViewModel(app: Application) : AndroidViewModel(app) {
 
     fun peekChallengePair(): Pair<String?, String?> = _challengeTitle.value to _challengeDescription.value
 
-    // Staged editor design that survives rotation (single write path; singleton is fallback).
+    // Staged designs survive configuration changes.
     private val _stagedDesign =
         kotlinx.coroutines.flow.MutableStateFlow<com.example.myapplicationkoG.ui.editor.LoadedDesign?>(null)
 
@@ -109,18 +93,14 @@ class GarmentInputViewModel(app: Application) : AndroidViewModel(app) {
         com.example.myapplicationkoG.ui.editor.DesignSession.stage(dye, buttons)
     }
 
-    /** One-shot: ViewModel first, singleton fallback. Clears both so nothing is applied twice. */
+    /** Consumes the staged design exactly once. */
     fun consumeStagedDesign(): com.example.myapplicationkoG.ui.editor.LoadedDesign? {
         val staged = _stagedDesign.getAndUpdate { null }
         val fallback = com.example.myapplicationkoG.ui.editor.DesignSession.consume()
         return staged ?: fallback
     }
 
-    // ---- Editor rotation drafts: plain vars (no observation needed).
-    // The editor writes its live dye/buttons/side here on every change;
-    // a recreated editor (rotation) re-seeds from them when no staged design
-    // is pending. Cleared by clearAll()/new staging. Undo stacks stay
-    // session-local (rotation loses undo history — accepted, edits survive).
+    // Draft editor state is restored after configuration changes.
     var draftDye: Map<GarmentSideId, com.example.myapplicationkoG.ui.editor.DyeState>? = null
     var draftButtons: Map<GarmentSideId, List<com.example.myapplicationkoG.ui.editor.PlacedButton>>? = null
     var draftSide: GarmentSideId = GarmentSideId.FRONT
@@ -138,11 +118,7 @@ class GarmentInputViewModel(app: Application) : AndroidViewModel(app) {
         loadDesignPaths(front, back)
     }
 
-    /**
-     * Cloud-cutout for an already-local file (Accept Challenge downloads).
-     * Same cache + pipeline as photographed picks; throws on invalid photo
-     * so callers can toast instead of opening a broken editor.
-     */
+    /** Creates or retrieves the cached cutout for a local image. */
     suspend fun cutoutLocalFile(file: File): File = withContext(Dispatchers.IO) {
         val out = File(cacheDir, "cutout2_${sha256(file)}.png")
         if (out.exists() && out.length() > 0L) return@withContext out
@@ -156,8 +132,6 @@ class GarmentInputViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun loadDesignPaths(front: File, back: File) {
-        // Snapshot the paths being replaced so they can be deleted after the
-        // new ones are committed.
         val oldFront = _state.value.frontCutoutPath
         val oldBack = _state.value.backCutoutPath
         _state.update {
@@ -170,8 +144,6 @@ class GarmentInputViewModel(app: Application) : AndroidViewModel(app) {
                 loadingSide = null
             )
         }
-        // The new design is live, so queued paths (from earlier deferred clears)
-        // plus the paths just replaced are now safe to delete.
         val toDelete = mutableListOf<String>()
         synchronized(pendingDeletionPaths) {
             toDelete.addAll(pendingDeletionPaths)
@@ -184,8 +156,7 @@ class GarmentInputViewModel(app: Application) : AndroidViewModel(app) {
                 runCatching { File(path).delete() }
             }
         }
-        // LRU: cap the cutout cache at 20 files so repeated sessions cannot grow
-        // storage without bound; oldest by mtime go first.
+        // Bound cached cutouts to avoid unbounded storage growth.
         runCatching {
             val files = cacheDir.listFiles()?.sortedBy { it.lastModified() } ?: emptyList()
             if (files.size > 20) {
@@ -194,23 +165,16 @@ class GarmentInputViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /**
-     * Clears UI state. By default keeps cache files (deferred deletion) so onBack
-     * does not immediately delete files. Files are deleted when a new design is
-     * successfully loaded or when [deleteFiles] is true (explicit clear / LRU).
-     */
+    /** Clears editor state and optionally deletes associated cached assets. */
     fun clearAll(deleteFiles: Boolean = false) {
-        // Snapshot atomically: a plain assignment races onPickedImage's update{}
-        // and can resurrect cleared state or drop a fresh cutout.
+        // Atomically replace state to avoid racing an in-flight image import.
         val snap = _state.getAndUpdate { GarmentInputUiState() }
         val queued: List<String> = synchronized(pendingDeletionPaths) {
             if (deleteFiles) {
-                // Explicit clear: delete immediately (current + queued).
                 val all = pendingDeletionPaths.toList()
                 pendingDeletionPaths.clear()
                 all
             } else {
-                // Defer deletion: queue current paths for deletion after next successful load.
                 snap.frontCutoutPath?.let { pendingDeletionPaths.add(it) }
                 snap.backCutoutPath?.let { pendingDeletionPaths.add(it) }
                 emptyList()
@@ -229,32 +193,25 @@ class GarmentInputViewModel(app: Application) : AndroidViewModel(app) {
         draftButtons = null
         draftSide = GarmentSideId.FRONT
         com.example.myapplicationkoG.ui.editor.DesignSession.clear()
-        // Leaving the design orphans any in-flight try-on and its temp files.
         clearVton()
     }
 
-    /** Back navigation: clear state but keep cache files until explicit clear or LRU. */
     fun clearForBack() {
         clearAll(deleteFiles = false)
     }
 
-    /**
-     * Account switch: wipe staged challenge/design/drafts and delete temp
-     * files, so the next login on this device starts from a clean studio.
-     */
+    /** Clears user-specific editor state during logout. */
     fun clearForLogout() {
         cancelVtonRun()
         clearChallenge()
         clearAll(deleteFiles = true)
     }
 
-    /** Explicit user clear that should delete files now. */
     fun clearAllExplicit() {
         clearAll(deleteFiles = true)
     }
 
-    // ---- VTON run state: lives here (not in the dialog) so rotation neither
-    // kills a running try-on nor leaks its temp files. Dialog only observes. ----
+    // The ViewModel owns try-on work so it survives configuration changes.
     val vtonRepo = VtonRepository()
     private val _vtonRunning = MutableStateFlow(false)
     val vtonRunning: StateFlow<Boolean> = _vtonRunning.asStateFlow()
@@ -266,7 +223,6 @@ class GarmentInputViewModel(app: Application) : AndroidViewModel(app) {
     fun startVtonRun(person: File, garment: File, onError: (String) -> Unit) {
         if (_vtonRunning.value) return
         _vtonRunning.value = true
-        // Take ownership: dialog may die (rotation), the file must not leak.
         vtonPersonFile = person
         vtonJob = viewModelScope.launch {
             try {
@@ -274,7 +230,7 @@ class GarmentInputViewModel(app: Application) : AndroidViewModel(app) {
                 runCatching { _vtonResultPath.value?.let { File(it).delete() } }
                 _vtonResultPath.value = out.absolutePath
             } catch (e: kotlinx.coroutines.CancellationException) {
-                throw e // user cancel: silent, finally still resets state
+                throw e
             } catch (t: Throwable) {
                 onError(t.message?.takeIf { it.isNotBlank() } ?: "Try-on failed")
             } finally {
@@ -284,8 +240,7 @@ class GarmentInputViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** User-pressed Cancel: aborts the Job and the socket - both are needed,
-     *  cancelling only one leaves the other half of the run alive. */
+    /** Cancels the active try-on request and releases its network resources. */
     fun cancelVtonRun() {
         vtonJob?.cancel()
         vtonJob = null
@@ -293,7 +248,7 @@ class GarmentInputViewModel(app: Application) : AndroidViewModel(app) {
         _vtonRunning.value = false
     }
 
-    /** Real dialog dismiss only (never on rotation): stop + delete temps. */
+    /** Cancels the active try-on and deletes its temporary files. */
     fun clearVton() {
         cancelVtonRun()
         runCatching { vtonPersonFile?.delete() }
@@ -303,10 +258,7 @@ class GarmentInputViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun onPickedImage(side: GarmentSideId, uri: Uri) {
-        // Per-side gate rather than a global isLoading: a FRONT inference must not
-        // swallow a BACK pick, while a double-tap on the same side is still
-        // ignored. The mutex serializes the two sides; the second waiter blocks
-        // and then runs instead of being dropped.
+        // Ignore duplicate requests for the same side while serializing file operations.
         if (_state.value.loadingSide == side) return
         viewModelScope.launch {
             pickerMutex.withLock {
@@ -317,7 +269,6 @@ class GarmentInputViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
             try {
-                // Previous cutout for this side, deleted only once the new one is saved.
                 val oldPath = when (side) {
                     GarmentSideId.FRONT -> _state.value.frontCutoutPath
                     GarmentSideId.BACK -> _state.value.backCutoutPath
@@ -326,27 +277,21 @@ class GarmentInputViewModel(app: Application) : AndroidViewModel(app) {
                     val imported = copyToCache(uri)
                         ?: error("Could not import picked image")
                     try {
-                        // Same bytes always map to the same cutout, so the cache hit
-                        // skips inference entirely. The key carries a version prefix:
-                        // bump it when the pipeline changes so stale results from the
-                        // old model are never reused.
+                        // A content-addressed file reuses prior cutouts safely.
                         val out = File(cacheDir, "cutout2_${sha256(imported)}.png")
                         if (!(out.exists() && out.length() > 0L)) {
                             val result = inference.run(imported)
                             try {
                                 savePng(result.cutout, out)
                             } finally {
-                                // pipeline returns a fresh bitmap, recycle after saving to avoid OOM
                                 runCatching { if (!result.cutout.isRecycled) result.cutout.recycle() }
                             }
                         }
-                        // Delete old cutout file for this side
                         if (oldPath != null && oldPath != out.absolutePath) {
                             runCatching { File(oldPath).delete() }
                         }
                         out
                     } finally {
-                        // clean up imported temp file
                         runCatching { imported.delete() }
                     }
                 }

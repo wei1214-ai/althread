@@ -90,17 +90,7 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import com.example.myapplicationkoG.textColorForTheme
 
-/**
- * Design-space editor.
- *
- * Ownership:
- * - [dyeMap]/[buttonMap] below are the source of truth for the current design;
- *   every committed edit writes them immediately.
- * - [GarmentInputViewModel.draftDye]/[draftButtons]/[draftSide] mirror the maps so
- *   rotation re-seeds the UI. Undo/redo stacks are session-local (not restored).
- * - VTON execution lives in the ViewModel; this screen only builds the composite
- *   garment file and observes the run via [VtonDialog].
- */
+/** Editor state models for garment customizations. */
 data class DyeState(val color: Color, val strength: Float)
 data class PlacedButton(val pos: Offset, val scale: Float, val color: Color, val style: Int = 0, val rotation: Float = 0f)
 data class EditorSnapshot(
@@ -115,7 +105,6 @@ fun EditorPlaceHolder(
     onBack: () -> Unit,
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
-    // Seeded from the ViewModel draft so rotation restores side and edits.
     var currentSide by remember { mutableStateOf(viewModel.draftSide) }
     val currentPath = when (currentSide) {
         GarmentSideId.FRONT -> state.frontCutoutPath
@@ -140,20 +129,18 @@ fun EditorPlaceHolder(
         saveDialogVisible = true
     }
 
-    // Tool + dye editing state - default no tool open, no dim
     var selectedTool by remember { mutableStateOf<Int?>(null) }
     var dyeColor by remember { mutableStateOf(Color(0xFF1A237E)) }
     var dyeStrength by remember { mutableFloatStateOf(0.55f) }
     var dyeMap by remember { mutableStateOf(mapOf<GarmentSideId, DyeState>()) }
     var dyedImage by remember { mutableStateOf<ImageBitmap?>(null) }
     var dyedBacking by remember { mutableStateOf<android.graphics.Bitmap?>(null) }
-    // Last rendered (path, color, strength); equal values skip re-render.
+    // Prevent redundant preview rendering for identical inputs.
     var lastPreviewKey by remember { mutableStateOf<Triple<String, Int, Float>?>(null) }
     var buttonMap by remember { mutableStateOf(mapOf<GarmentSideId, List<PlacedButton>>()) }
     var overlaySize by remember { mutableStateOf(IntSize.Zero) }
     var buttonImgs by remember { mutableStateOf(mapOf<Int, ImageBitmap>()) }
     var buttonContent by remember { mutableStateOf(mapOf<Int, Pair<Float, Float>>()) }
-    // One committed edit per history entry.
     var undoStack by remember { mutableStateOf(listOf<EditorSnapshot>()) }
     var redoStack by remember { mutableStateOf(listOf<EditorSnapshot>()) }
     var prevTool by remember { mutableStateOf<Int?>(null) }
@@ -169,7 +156,6 @@ fun EditorPlaceHolder(
     )
 
     var dyeActive by remember { mutableStateOf(false) }
-    // True while a strength-slider drag is in flight (undo pushed once at drag start).
     var dyeSliderActive by remember { mutableStateOf(false) }
     var buttonScale by remember { mutableFloatStateOf(1f) }
     var buttonStyle by remember { mutableIntStateOf(0) }
@@ -184,7 +170,6 @@ fun EditorPlaceHolder(
         rotDragStart = null
     }
 
-    // Apply a staged Continue-screen design once, else re-seed from the rotation draft.
     LaunchedEffect(Unit) {
         val staged = viewModel.consumeStagedDesign()
         if (staged != null) {
@@ -200,7 +185,7 @@ fun EditorPlaceHolder(
         }
     }
 
-    // Mirror committed edits into the ViewModel draft for rotation recovery.
+    // Persist the latest edit state for configuration changes.
     LaunchedEffect(dyeMap, buttonMap, currentSide) {
         viewModel.draftDye = dyeMap
         viewModel.draftButtons = buttonMap
@@ -309,13 +294,10 @@ fun EditorPlaceHolder(
         selectedButtonIdx = -1
         sizeDragStart = null
         rotDragStart = null
-        // Clear the challenge fields together so a stale post id cannot leak
-        // into the next saved design.
         viewModel.clearChallenge()
         Toast.makeText(context, "Design cleared", Toast.LENGTH_SHORT).show()
     }
 
-    // Snapshot pre-dye state once when the dye tool opens.
     LaunchedEffect(selectedTool) {
         if (selectedTool == 0 && prevTool != 0) {
             pushHistory()
@@ -326,7 +308,6 @@ fun EditorPlaceHolder(
         prevTool = selectedTool
     }
 
-    // Dye preview while editing, committed dye otherwise.
     val activeDye: DyeState? = if (selectedTool == 0) {
         if (dyeActive) DyeState(dyeColor, dyeStrength) else null
     } else dyeMap[currentSide]
@@ -340,12 +321,10 @@ fun EditorPlaceHolder(
             lastPreviewKey = null
             return@LaunchedEffect
         }
-        // Skip re-render when the inputs are value-identical.
         val key = Triple(path, dye.color.toArgb(), dye.strength)
         if (key == lastPreviewKey && dyedImage != null) return@LaunchedEffect
-        // Debounce: render once the slider settles instead of once per tick.
         kotlinx.coroutines.delay(180)
-        // Render at display size; the preview cannot show more pixels than the canvas.
+        // Preview resolution is capped to the display size.
         val edge = maxOf(overlaySize.width, overlaySize.height, 1).coerceIn(720, 1600)
         val bmp = withContext(Dispatchers.Default) {
             runCatching { makeDyedBitmap(path, dye.color, dye.strength, edge) }.getOrNull()
@@ -360,13 +339,12 @@ fun EditorPlaceHolder(
         if (bmp != null) lastPreviewKey = key
     }
 
-    // Warm the downsampled hit-test bitmap off the main thread so taps never decode on it.
+    // Preload the hit-test bitmap away from the main thread.
     LaunchedEffect(currentPath) {
         val path = currentPath ?: return@LaunchedEffect
         withContext(Dispatchers.Default) { runCatching { hitBitmap(path) } }
     }
 
-    // Button/patch textures: styles 0-2 are circularly masked, 3-6 keep shape.
     LaunchedEffect(Unit) {
         val (imgs, boxes) = withContext(Dispatchers.Default) {
             val mImg = mutableMapOf<Int, ImageBitmap>()

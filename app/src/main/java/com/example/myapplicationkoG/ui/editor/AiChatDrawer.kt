@@ -80,10 +80,8 @@ fun AiChatDrawer(
     visible: Boolean,
     onDismiss: () -> Unit,
     modifier: Modifier = Modifier,
-    // "studio" = design coach (dye/patch KB + garment sidecar),
-    // "home" = daily outfit advisor (no design uploads).
+    // Determines whether design context can be attached to a message.
     mode: String = "studio",
-    // Current design-space garment cutouts (studio mode only).
     designFrontPath: String? = null,
     designBackPath: String? = null
 ) {
@@ -92,10 +90,9 @@ fun AiChatDrawer(
     var inputText by remember { mutableStateOf("") }
     var isLoading by remember { mutableStateOf(false) }
     var errorText by remember { mutableStateOf<String?>(null) }
-    // User-picked photos (data URIs, downscaled). Max 3 per message (token cost).
+    // Attach up to three downscaled images per message.
     var attachedImages by remember { mutableStateOf<List<String>>(emptyList()) }
-    // One-shot: include front+back cutouts with the next send, then auto-off.
-    // Studio only — Home has no design sidecar.
+    // Design context is included once and then cleared after sending.
     var attachDesign by remember(designFrontPath, designBackPath) {
         mutableStateOf(isStudio && (designFrontPath != null || designBackPath != null))
     }
@@ -116,7 +113,7 @@ fun AiChatDrawer(
                 ?: return null
             try {
                 val longEdge = maxOf(bmp.width, bmp.height)
-                // 1024px JPEG75 keeps vision tokens cheap (~200-400KB).
+                // Downscale uploads to keep request size and vision-token usage bounded.
                 if (longEdge > 1024) {
                     val scale = 1024f / longEdge
                     val scaled = android.graphics.Bitmap.createScaledBitmap(
@@ -137,7 +134,7 @@ fun AiChatDrawer(
         }
     }
 
-    /** Design cutout file -> downscaled data URI (same budget as uploads). */
+    /** Converts a design cutout to a size-bounded data URI. */
     fun fileToDataUri(path: String): String? {
         return try {
             val f = java.io.File(path)
@@ -182,14 +179,11 @@ fun AiChatDrawer(
     }
     fun doSend() {
         val text = inputText.trim()
-        // Design cutouts ride along one-shot when the chip is on.
         val designImages = if (attachDesign) {
             listOfNotNull(designFrontPath, designBackPath).mapNotNull { fileToDataUri(it) }
         } else emptyList()
         val images = (designImages + attachedImages).take(3)
         if ((text.isEmpty() && images.isEmpty()) || isLoading) return
-        // NOTE: keyboard + focus intentionally left alone — user usually sends
-        // several messages in a row; dismissing the keyboard each time is hostile.
         inputText = ""
         attachedImages = emptyList()
         attachDesign = false
@@ -237,7 +231,6 @@ fun AiChatDrawer(
                     .clickable { onDismiss() }
             )
 
-            // Drawer rides the keyboard: dialog window resizes for IME
             AnimatedVisibility(
                 visible = true,
                 modifier = Modifier.align(Alignment.CenterEnd),
@@ -246,13 +239,9 @@ fun AiChatDrawer(
             ) {
                 Column(
                     modifier = Modifier
-                        // Leave breathing room above and below the drawer on tall phones.
                         .fillMaxHeight(0.88f)
-                        // Use the available phone width instead of a fixed drawer width.
-                        // The max keeps the drawer comfortable on tablets.
                         .fillMaxWidth(0.92f)
                         .widthIn(max = 420.dp)
-                        // Keep the message input above Android navigation buttons and the keyboard.
                         .navigationBarsPadding()
                         .imePadding()
                         .clip(RoundedCornerShape(topStart = 20.dp, bottomStart = 20.dp))
