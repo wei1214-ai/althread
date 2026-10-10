@@ -1,5 +1,6 @@
 package com.example.myapplicationkoG
 
+/** Navigation destinations. */
 sealed class Screen(val route: String) {
     object Auth : Screen("auth")
     object Upload : Screen("upload")
@@ -12,7 +13,6 @@ sealed class Screen(val route: String) {
     object ForgotPassword : Screen("forgot_password")
     object ResetPassword : Screen("reset_password")
 
-    // Part 1 editor flow
     object GarmentInput : Screen("garment_input")
     object Editor : Screen("editor")
     

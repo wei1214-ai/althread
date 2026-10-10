@@ -67,7 +67,15 @@ fun EditProfileScreen(
     }
 
     val hasChanges = username.trim() != originalUsername.trim() || bio.trim() != originalBio.trim()
-    val isSaveEnabled = !isSaving && hasChanges && username.isNotBlank()
+    val usernameRegex = Regex("^[a-z0-9_.]+$")
+    val usernameError: String? = when {
+        username.isBlank() -> null // empty handled by save-enabled logic
+        username.trim().length < 3 -> "Username must be at least 3 characters."
+        username.trim().length > 20 -> "Username must be at most 20 characters."
+        !usernameRegex.matches(username.trim().lowercase()) -> "Only lowercase letters, numbers, _ and ."
+        else -> null
+    }
+    val isSaveEnabled = !isSaving && hasChanges && username.isNotBlank() && usernameError == null && bio.length <= 150
 
     Column(
         modifier = Modifier
@@ -92,20 +100,24 @@ fun EditProfileScreen(
 
         OutlinedTextField(
             value = username,
-            onValueChange = { if (!it.contains("\n")) username = it },
-            label = { Text("Username") },
+            onValueChange = { if (!it.contains("\n") && it.length <= 20) username = it },
+            label = { Text("Username (3-20, a-z 0-9 _ .)") },
             modifier = Modifier.fillMaxWidth(),
-            singleLine = true
+            singleLine = true,
+            isError = usernameError != null,
+            supportingText = { if (usernameError != null) Text(usernameError) }
         )
 
         Spacer(modifier = Modifier.height(16.dp))
 
         OutlinedTextField(
             value = bio,
-            onValueChange = { if (it.lines().size <= 5) bio = it },
+            // 150 = Instagram bio standard (X uses 160; IG fits a visual app better).
+            onValueChange = { if (it.lines().size <= 5 && it.length <= 150) bio = it },
             label = { Text("Bio") },
             modifier = Modifier.fillMaxWidth().height(120.dp),
-            maxLines = 5
+            maxLines = 5,
+            supportingText = { Text("${bio.length}/150") }
         )
 
         Spacer(modifier = Modifier.height(24.dp))
@@ -115,6 +127,10 @@ fun EditProfileScreen(
             onClick = {
                 if (username.isBlank()) {
                     errorMessage = "Username cannot be empty"
+                    return@Button
+                }
+                if (usernameError != null) {
+                    errorMessage = usernameError
                     return@Button
                 }
 

@@ -33,7 +33,6 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.platform.LocalContext
-import com.example.myapplicationkoG.ui.editor.DesignSession
 import com.example.myapplicationkoG.ui.editor.DyeState
 import com.example.myapplicationkoG.ui.editor.EditorPlaceHolder
 import com.example.myapplicationkoG.ui.editor.PlacedButton
@@ -62,6 +61,12 @@ class MainActivity : ComponentActivity() {
         supabase.handleDeeplinks(intent)
         extractPostIdFromIntent(intent)
         extractPasswordRecoveryFromIntent(intent)
+        // Restore persisted session + refresh expired token on cold start.
+        // Without this, all queries run as anon after restart and hit 401/RLS.
+        lifecycleScope.launch {
+            runCatching { supabase.auth.refreshCurrentSession() }
+            runCatching { supabase.auth.retrieveUserForCurrentSession() }
+        }
 
         enableEdgeToEdge()
         setContent {
@@ -71,12 +76,27 @@ class MainActivity : ComponentActivity() {
 
             val themeMode = runCatching { ThemeMode.valueOf(savedThemeMode) }.getOrElse { ThemeMode.SYSTEM }
 
+            // Start on Auth each launch so the user confirms identity.
+            // The session is still refreshed so post-login calls stay authenticated.
+            var startDestination by remember { mutableStateOf<String?>(null) }
+            LaunchedEffect(Unit) {
+                runCatching { supabase.auth.refreshCurrentSession() }
+                runCatching { supabase.auth.retrieveUserForCurrentSession() }
+                startDestination = Screen.Auth.route
+            }
+
             AltThreadTheme(themeMode = themeMode) {
                 val sharedPostId = sharedPostIdState.value
 
-                AltThreadApp(
-                    garmentInputVm = garmentInputViewModel,
-                    sharedPostId = sharedPostId,
+                if (startDestination == null) {
+                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        CircularProgressIndicator(color = MidnightBlue)
+                    }
+                } else {
+                    AltThreadApp(
+                        garmentInputVm = garmentInputViewModel,
+                        startDestination = startDestination!!,
+                        sharedPostId = sharedPostId,
                     onDismissSharedPost = { sharedPostIdState.value = null },
                     passwordRecoveryRequested = passwordRecoveryState.value,
                     onDismissPasswordRecovery = { passwordRecoveryState.value = false },
@@ -86,6 +106,7 @@ class MainActivity : ComponentActivity() {
                         savedThemeMode = newThemeMode.name
                     }
                 )
+                }
             }
         }
     }
@@ -122,9 +143,17 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+/**
+ * Root navigation graph for the app.
+ *
+ * @param garmentInputVm shared studio ViewModel retained across destinations.
+ * @param startDestination initial route once the session check completes.
+ * @param sharedPostId deep-linked post id to show in a dialog, if any.
+ */
 @Composable
 fun AltThreadApp(
     garmentInputVm: GarmentInputViewModel,
+    startDestination: String = Screen.Auth.route,
     sharedPostId: String? = null,
     onDismissSharedPost: () -> Unit = {},
     passwordRecoveryRequested: Boolean = false,
@@ -142,6 +171,9 @@ fun AltThreadApp(
     var postsRefreshKey by remember { mutableIntStateOf(0) }
     var homeChallengeFilter by remember { mutableStateOf("For You") }
     var isLoadingSharedPost by remember { mutableStateOf(false) }
+    // Serializes challenge/design launches; saveable so rotation cannot start a second chain.
+    var openingChallenge by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(false) }
+    var openingDesign by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(false) }
     val postRepository = remember { PostRepository() }
 
     LaunchedEffect(passwordRecoveryRequested) {
@@ -149,6 +181,9 @@ fun AltThreadApp(
             navController.navigate(Screen.ResetPassword.route) {
                 launchSingleTop = true
             }
+            // Consume as a one-shot event so back navigation cannot retrigger it,
+            // while a later deep link still fires again.
+            onDismissPasswordRecovery()
         }
     }
 
@@ -191,6 +226,11 @@ fun AltThreadApp(
     }
 
     if (sharedPostId != null) {
+        // Dismissal is a side effect: trigger it from an effect rather than during
+        // composition, so state is not written mid-composition.
+        LaunchedEffect(sharedPostId, isLoadingSharedPost, sharedPost) {
+            if (!isLoadingSharedPost && sharedPost == null) onDismissSharedPost()
+        }
         Dialog(onDismissRequest = onDismissSharedPost) {
             Box(
                 modifier = Modifier
@@ -198,19 +238,19 @@ fun AltThreadApp(
                     .padding(vertical = 16.dp),
                 contentAlignment = Alignment.Center
             ) {
-                if (isLoadingSharedPost) {
+                // Capture once: sharedPost can become null before the click runs.
+                val post = sharedPost
+                if (isLoadingSharedPost || post == null) {
                     CircularProgressIndicator(color = MidnightBlue)
-                } else if (sharedPost != null) {
+                } else {
                     PostCard(
-                        post = sharedPost!!,
+                        post = post,
                         onUserClick = {userId, username, avatarUrl ->
                             onDismissSharedPost()
                             navigateToUserProfile(userId, username, avatarUrl)
                         },
                         onOpenChallengeSource = onOpenChallengeSource
                     )
-                } else {
-                    onDismissSharedPost()
                 }
             }
         }
@@ -226,7 +266,7 @@ fun AltThreadApp(
     ) { innerPadding ->
         NavHost(
             navController = navController,
-            startDestination = Screen.Auth.route,
+            startDestination = startDestination,
             modifier = Modifier.padding(innerPadding)
         ) {
             composable(Screen.Auth.route) {
@@ -273,6 +313,8 @@ fun AltThreadApp(
                     },
                     onAcceptChallenge = { post ->
                         val ctx = navController.context
+                        if (openingChallenge) return@HomeScreen
+                        openingChallenge = true
                         scope.launch {
                             try {
                                 val urls = post.allMediaUrls.ifEmpty { listOf(post.mediaUrl) }
@@ -286,16 +328,27 @@ fun AltThreadApp(
                                 val frontFile = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { downloadUrlToFile(ctx, rawFront, "challenge_front") }
                                 val backFile = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { downloadUrlToFile(ctx, rawBack, "challenge_back") }
                                 if (frontFile.length() == 0L || backFile.length() == 0L) error("Downloaded file is empty")
-                                // Use ViewModel for rotation survival (singleton delegates to same SessionHolder for compat)
+                                // Staged via the ViewModel so the state survives rotation.
                                 runCatching { garmentInputVm.stageChallenge(post.id, post.clothingTitle, post.caption) }
                                     .onFailure { com.example.myapplicationkoG.ui.editor.ChallengeSession.stage(post.id, post.clothingTitle, post.caption) }
                                 garmentInputVm.clearAll(deleteFiles = false)
-                                garmentInputVm.loadDesignPaths(frontFile, backFile)
-                                navController.navigate(Screen.Editor.route)
+                                // Run both sides through the same cloud cutout pipeline
+                                // as photographed picks before opening the editor.
+                                android.widget.Toast.makeText(ctx, "Removing background...", android.widget.Toast.LENGTH_SHORT).show()
+                                val frontCut = garmentInputVm.cutoutLocalFile(frontFile)
+                                val backCut = garmentInputVm.cutoutLocalFile(backFile)
+                                runCatching { frontFile.delete() }
+                                runCatching { if (backFile != frontFile) backFile.delete() }
+                                garmentInputVm.loadDesignPaths(frontCut, backCut)
+                                navController.navigate(Screen.Editor.route) {
+                                    launchSingleTop = true
+                                }
                             } catch (e: Exception) {
                                 e.printStackTrace()
                                 val msg = e.message?.takeIf { it.isNotBlank() } ?: e.toString()
                                 android.widget.Toast.makeText(ctx, "Failed to load challenge: $msg", android.widget.Toast.LENGTH_LONG).show()
+                            } finally {
+                                openingChallenge = false
                             }
                         }
                     },
@@ -306,10 +359,8 @@ fun AltThreadApp(
             composable(Screen.Studio.route) {
                 StudioScreen(
                     onStartDesign = {
-                        runCatching { garmentInputVm.clearChallenge() }
-                        // keep singleton in sync for backward compat
-                        com.example.myapplicationkoG.ui.editor.ChallengeSession.title = null
-                        com.example.myapplicationkoG.ui.editor.ChallengeSession.description = null
+                        // clearChallenge() syncs the ViewModel and session together.
+                        garmentInputVm.clearChallenge()
                         garmentInputVm.clearAll(deleteFiles = false)
                         navController.navigate(Screen.GarmentInput.route)
                     },
@@ -342,11 +393,9 @@ fun AltThreadApp(
                     },
                     onLogout = {
                         navController.navigate(Screen.Auth.route){
-                            popUpTo(0){ // Clear navigation history,
-                                // after logout user press back button wont
-                                // go back to previous screen
-                                inclusive = true
-                            }
+                            // Clear the back stack so Back does not return to
+                            // an authenticated screen after signing out.
+                            popUpTo(0){ inclusive = true }
                         }
                     }
                 )
@@ -418,17 +467,22 @@ fun AltThreadApp(
                 ContinueDesignsScreen(
                     onOpenDesign = { row ->
                         val repo = DesignRepository()
+                        if (openingDesign) return@ContinueDesignsScreen
+                        openingDesign = true
                         scope.launch {
-                            val (front, back) = repo.ensureLocalFiles(ctx, row)
-                            runCatching { garmentInputVm.clearChallenge() }
-                            com.example.myapplicationkoG.ui.editor.ChallengeSession.postId = null
-                            garmentInputVm.openSavedDesign(
-                                id = row.id,
-                                name = row.name,
-                                front = front,
-                                back = back,
-                                challengePostId = row.state.challengePostId
-                            )
+                            try {
+                                val (front, back) = repo.ensureLocalFiles(ctx, row)
+                                garmentInputVm.clearChallenge()
+                                // Propagate the saved design's challenge link so the Brief banner shows.
+                                garmentInputVm.challengePostId = row.state.challengePostId
+                                com.example.myapplicationkoG.ui.editor.ChallengeSession.postId = row.state.challengePostId
+                                garmentInputVm.openSavedDesign(
+                                    id = row.id,
+                                    name = row.name,
+                                    front = front,
+                                    back = back,
+                                    challengePostId = row.state.challengePostId
+                                )
                             val dyeMap = row.state.dye.mapKeys { entry ->
                                 runCatching { com.example.myapplicationkoG.domain.model.GarmentSideId.valueOf(entry.key) }.getOrElse { com.example.myapplicationkoG.domain.model.GarmentSideId.FRONT }
                             }.mapValues { (_, v) ->
@@ -439,10 +493,18 @@ fun AltThreadApp(
                             }.mapValues { (_, list) ->
                                 list.map { PlacedButton(pos = Offset(it.x, it.y), scale = it.scale, color = androidx.compose.ui.graphics.Color(it.color), style = it.style, rotation = it.rotation) }
                             }
-                            // Use ViewModel for rotation survival (singleton kept for backward compat)
-                            runCatching { garmentInputVm.stageDesignTyped(dyeMap, buttonMap) }
-                                .onFailure { DesignSession.stage(dye = dyeMap, buttons = buttonMap) }
-                            navController.navigate(Screen.Editor.route)
+                            // The ViewModel owns the staged design so it survives rotation.
+                            garmentInputVm.stageDesignTyped(dyeMap, buttonMap)
+                            navController.navigate(Screen.Editor.route) {
+                                launchSingleTop = true
+                            }
+                            } catch (e: Exception) {
+                                e.printStackTrace()
+                                val msg = e.message?.takeIf { it.isNotBlank() } ?: e.toString()
+                                android.widget.Toast.makeText(ctx, "Could not open design: $msg", android.widget.Toast.LENGTH_LONG).show()
+                            } finally {
+                                openingDesign = false
+                            }
                         }
                     },
                     onBack = { navController.popBackStack() }
@@ -451,9 +513,13 @@ fun AltThreadApp(
             composable(Screen.GarmentInput.route) {
                 GarmentInputScreen(
                     viewModel = garmentInputVm,
-                    onOpenEditor = { navController.navigate(Screen.Editor.route) },
+                    onOpenEditor = {
+                        navController.navigate(Screen.Editor.route) {
+                            launchSingleTop = true
+                        }
+                    },
                     onBack = {
-                        // Defer deletion: keep cache files until explicit clear or new design loaded (LRU)
+                        // Keep cache files until an explicit clear or a new design replaces them.
                         garmentInputVm.clearForBack()
                         navController.popBackStack()
                     },
@@ -469,12 +535,22 @@ fun AltThreadApp(
     }
 }
 
+private val sharedOkHttpClient: okhttp3.OkHttpClient by lazy {
+    okhttp3.OkHttpClient.Builder()
+        .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+        .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+        .build()
+}
+
 private suspend fun downloadUrlToFile(context: android.content.Context, url: String, prefix: String): java.io.File {
     return with(kotlinx.coroutines.Dispatchers.IO) {
-        val bytes = okhttp3.OkHttpClient().newCall(okhttp3.Request.Builder().url(url).build()).execute().use { resp ->
+        val bytes = sharedOkHttpClient.newCall(okhttp3.Request.Builder().url(url).build()).execute().use { resp ->
             if (!resp.isSuccessful) error("Download failed: ${resp.code}")
+            val contentLength = resp.body?.contentLength() ?: -1L
+            if (contentLength > 50L * 1024 * 1024) error("Remote file too large (max 50MB).")
             resp.body?.bytes() ?: error("Empty body")
         }
+        if (bytes.isEmpty()) error("Downloaded file is empty")
         val out = java.io.File(context.cacheDir, "${prefix}_${System.currentTimeMillis()}.jpg").apply { parentFile?.mkdirs() }
         out.writeBytes(bytes)
         out

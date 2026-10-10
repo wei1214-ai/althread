@@ -106,6 +106,30 @@ private fun UploadTabItem(
     }
 }
 
+// Product-wide input caps.
+// Researched against 2026 platform limits (TypeCount/Buffer/IG Help Center):
+// X post 280, Bluesky 300, Threads 500, Pinterest pin 500, TikTok comment 150,
+// IG bio 150 / username 30. Our feed cards have NO "see more" fold (PostCard
+// renders the full caption, IG hides after 125), so captions stay at 280 (X
+// standard) instead of 500 — otherwise one post fills the whole screen.
+// Email 254 = RFC 5321, password 64 = bcrypt-safe (unchanged).
+internal const val MAX_POST_CAPTION = 280
+internal const val MAX_CHALLENGE_TITLE = 50
+internal const val MAX_CHALLENGE_CAPTION = 280
+internal const val MAX_DESIGN_CAPTION = 280
+
+/** Emoji-safe take: Kotlin take(n) can split surrogate pairs and render tofu. */
+internal fun String.safeTake(n: Int): String {
+    if (length <= n) return this
+    var count = 0
+    var i = 0
+    while (i < length && count < n) {
+        i += Character.charCount(codePointAt(i))
+        count++
+    }
+    return substring(0, i)
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun UploadScreen(
@@ -134,16 +158,14 @@ fun UploadScreen(
         unfocusedContainerColor = contentSurface
     )
 
-    var selectedTab by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf("Post") } // Post, Challenge, Design
+    var selectedTab by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf("Post") }
 
-    // Post states
     var selectedUris by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(emptyList<Uri>()) }
     var captionInput by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf("") }
     var selectedCategory by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf("Streetwear") }
     var isUploading by remember { mutableStateOf(false) }
     val categoriesList = listOf("Trend", "Vintage", "Streetwear")
 
-    // Challenge states - separate caption from Post to avoid sharing
     var challengeTitleInput by remember { mutableStateOf("") }
     var challengeCaptionInput by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf("") }
     var frontOrigUri by remember { mutableStateOf<Uri?>(null) }
@@ -158,9 +180,10 @@ fun UploadScreen(
     var postCameraUri by remember { mutableStateOf<Uri?>(null) }
     var frontCameraUri by remember { mutableStateOf<Uri?>(null) }
     var backCameraUri by remember { mutableStateOf<Uri?>(null) }
-    var pendingCameraSide by remember { mutableStateOf<String?>(null) }
+    // Survives rotation: the permission dialog may recreate the activity
+    // while it is showing, and the grant callback needs this value.
+    var pendingCameraSide by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf<String?>(null) }
 
-    // Design share states
     val designRepository = remember { DesignRepository() }
     var designRows by remember { mutableStateOf<List<DesignRow>?>(null) }
     var selectedDesign by remember { mutableStateOf<DesignRow?>(null) }
@@ -215,27 +238,22 @@ fun UploadScreen(
         return FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
     }
 
-    // Check if URI is a video
     fun isVideoUri(uri: Uri): Boolean {
         val type = context.contentResolver.getType(uri)
         return type?.startsWith("video/") == true || uri.toString().contains(".mp4")
     }
 
-    // Gallery picker: handle 1 video or up to 9 photos
     val galleryLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickMultipleVisualMedia(maxItems = 9)
     ) { uris ->
         if (uris.isNotEmpty()) {
             val containsVideo = uris.any { isVideoUri(it) }
             if (containsVideo) {
-                // If contains video, take only first video, only 1 video allowed
                 val videoUri = uris.first { isVideoUri(it) }
                 selectedUris = listOf(videoUri)
                 Toast.makeText(context, "Selected 1 video", Toast.LENGTH_SHORT).show()
             } else {
-                // If all are images, check if exceeds 9
                 if (selectedUris.any { isVideoUri(it) }) {
-                    // If previously selected video, overwrite with new images
                     selectedUris = uris.take(9)
                 } else if (selectedUris.size + uris.size > 9) {
                     Toast.makeText(context, "Max 9 photos allowed", Toast.LENGTH_SHORT).show()
@@ -493,7 +511,6 @@ fun UploadScreen(
             Spacer(modifier = Modifier.height(20.dp))
 
             if (selectedTab == "Post") {
-                // POST MODE ------------------------------------------------
                 Text("Create Post", fontSize = 20.sp, fontWeight = FontWeight.ExtraBold, color = textColorForTheme(MidnightBlue))
                 Spacer(modifier = Modifier.height(4.dp))
                 Text("Share your outfit with the community", fontSize = 13.sp, color = textColorForTheme(Color.Gray))
@@ -536,21 +553,20 @@ fun UploadScreen(
 
                 Spacer(modifier = Modifier.height(12.dp))
 
-                // Bio / Description input - capped at 5 lines, fixed height, internal scroll
                 OutlinedTextField(
                     value = captionInput,
-                    onValueChange = { if (it.lines().size <= 5) captionInput = it },
+                    onValueChange = { if (it.lines().size <= 5 && it.length <= MAX_POST_CAPTION) captionInput = it },
                     label = { Text("Description / Bio") },
                     placeholder = { Text("pink color cartoon clothes") },
                     modifier = Modifier.fillMaxWidth().height(120.dp),
                     maxLines = 5,
+                    supportingText = { Text("${captionInput.length}/$MAX_POST_CAPTION", fontSize = 11.sp) },
                     enabled = !isUploading,
                     shape = RoundedCornerShape(12.dp),
                     colors = textFieldColors
                 )
                 Spacer(modifier = Modifier.height(16.dp))
 
-                // Image/video picker box
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -568,7 +584,6 @@ fun UploadScreen(
                             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                                 Icon(painter = painterResource(id = R.drawable.addfromalbum), contentDescription = null, tint = MidnightBlue, modifier = Modifier.size(28.dp))
                                 Spacer(modifier = Modifier.height(8.dp))
-                                // Updated copy: require 1 video or up to 9 photos
                                 Text(
                                     "Tap the buttons below to add photos/videos\n(1 video or up to 9 photos)",
                                     color = textColorForTheme(Color.Gray),
@@ -649,7 +664,7 @@ fun UploadScreen(
                         isUploading = true
                         scope.launch {
                             try {
-                                val titleText = if (captionInput.isNotBlank()) captionInput.take(20) else selectedCategory
+                                val titleText = if (captionInput.isNotBlank()) captionInput.safeTake(20) else selectedCategory
                                 val success = repository.createPost(
                                     context = context,
                                     imageUris = selectedUris,
@@ -680,7 +695,6 @@ fun UploadScreen(
                 }
 
             } else if (selectedTab == "Challenge") {
-                // CHALLENGE MODE ------------------------------------------------
                 Text("Join Challenge", fontSize = 20.sp, fontWeight = FontWeight.ExtraBold, color = textColorForTheme(MidnightBlue))
                 Spacer(modifier = Modifier.height(4.dp))
                 Text("Upload front and back garment photos. Each will be processed to isolate the garment.", fontSize = 13.sp, color = textColorForTheme(Color.Gray))
@@ -718,22 +732,24 @@ fun UploadScreen(
 
                 OutlinedTextField(
                     value = challengeTitleInput,
-                    onValueChange = { challengeTitleInput = it },
+                    onValueChange = { if (it.length <= MAX_CHALLENGE_TITLE) challengeTitleInput = it },
                     label = { Text("Challenge Title") },
                     placeholder = { Text("My upcycle look") },
                     modifier = Modifier.fillMaxWidth(),
                     singleLine = true,
+                    supportingText = { Text("${challengeTitleInput.length}/$MAX_CHALLENGE_TITLE", fontSize = 11.sp) },
                     shape = RoundedCornerShape(12.dp),
                     colors = textFieldColors
                 )
                 Spacer(modifier = Modifier.height(12.dp))
                 OutlinedTextField(
                     value = challengeCaptionInput,
-                    onValueChange = { if (it.lines().size <= 4) challengeCaptionInput = it },
+                    onValueChange = { if (it.lines().size <= 4 && it.length <= MAX_CHALLENGE_CAPTION) challengeCaptionInput = it },
                     label = { Text("Description") },
                     placeholder = { Text("Tell us your story...") },
                     modifier = Modifier.fillMaxWidth().height(100.dp),
                     maxLines = 4,
+                    supportingText = { Text("${challengeCaptionInput.length}/$MAX_CHALLENGE_CAPTION", fontSize = 11.sp) },
                     shape = RoundedCornerShape(12.dp),
                     colors = textFieldColors
                 )
@@ -744,7 +760,11 @@ fun UploadScreen(
 
                 Button(
                     onClick = {
-                        if (frontCutoutPath == null || backCutoutPath == null) {
+                        // Snapshot the paths before launching: the state may be
+                        // cleared or re-picked while the coroutine is starting.
+                        val frontPath = frontCutoutPath
+                        val backPath = backCutoutPath
+                        if (frontPath == null || backPath == null) {
                             Toast.makeText(context, "Please upload and process both front and back images", Toast.LENGTH_SHORT).show()
                             return@Button
                         }
@@ -755,7 +775,13 @@ fun UploadScreen(
                         isUploading = true
                         scope.launch {
                             try {
-                                val uris = listOf(Uri.fromFile(File(frontCutoutPath!!)), Uri.fromFile(File(backCutoutPath!!)))
+                                val frontFile = File(frontPath)
+                                val backFile = File(backPath)
+                                if (!frontFile.exists() || !backFile.exists()) {
+                                    Toast.makeText(context, "Processed images expired, please re-upload", Toast.LENGTH_SHORT).show()
+                                    return@launch
+                                }
+                                val uris = listOf(Uri.fromFile(frontFile), Uri.fromFile(backFile))
                                 val success = repository.createPost(
                                     context = context,
                                     imageUris = uris,
@@ -786,7 +812,6 @@ fun UploadScreen(
                     else Text("Post Challenge", fontWeight = FontWeight.Bold, fontSize = 16.sp)
                 }
             } else {
-                // DESIGN MODE ------------------------------------------------
                 Text("Share Design", fontSize = 20.sp, fontWeight = FontWeight.ExtraBold, color = textColorForTheme(MidnightBlue))
                 Spacer(modifier = Modifier.height(4.dp))
                 Text("Pick a saved design. Its finished front and back become the main photos of your post.", fontSize = 13.sp, color = textColorForTheme(Color.Gray))
@@ -920,11 +945,12 @@ fun UploadScreen(
                     Spacer(modifier = Modifier.height(16.dp))
                     OutlinedTextField(
                         value = designCaptionInput,
-                        onValueChange = { if (it.lines().size <= 5) designCaptionInput = it },
+                        onValueChange = { if (it.lines().size <= 5 && it.length <= MAX_DESIGN_CAPTION) designCaptionInput = it },
                         label = { Text("Description") },
                         placeholder = { Text("Tell us about your design...") },
                         modifier = Modifier.fillMaxWidth().height(120.dp),
                         maxLines = 5,
+                        supportingText = { Text("${designCaptionInput.length}/$MAX_DESIGN_CAPTION", fontSize = 11.sp) },
                         enabled = !isUploading,
                         shape = RoundedCornerShape(12.dp),
                         colors = textFieldColors

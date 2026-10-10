@@ -4,7 +4,12 @@ import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.Transient
 
-// 1. Main Post Model with Multi-Image Support (Up to 9 images)
+/**
+ * Feed post supporting up to 9 images.
+ *
+ * [mediaUrls] holds 1-9 photos; [mediaUrl] is the legacy single-image field
+ * retained for backward compatibility.
+ */
 @Serializable
 data class Post(
     val id: String = "",
@@ -17,11 +22,9 @@ data class Post(
     @SerialName("user_profile_pic_url")
     val userProfilePicUrl: String? = null,
 
-    // Primary single image URL (retained for backward compatibility)
     @SerialName("media_url")
     val mediaUrl: String = "",
 
-    // List of multiple image URLs (supports 1 to 9 photos per post)
     @SerialName("media_urls")
     val mediaUrls: List<String> = emptyList(),
 
@@ -42,6 +45,9 @@ data class Post(
     @SerialName("like_count")
     val likeCount: Int = 0,
 
+    @SerialName("comment_count")
+    val commentCount: Int = 0,
+
     @SerialName("created_at")
     val createdAt: String = "",
 
@@ -51,19 +57,19 @@ data class Post(
     @SerialName("challenge_post_id")
     val challengePostId: String? = null,
 
-    // UI state helper fields (ignored during direct Supabase JSON parsing)
+    // UI-only state; excluded from the network payload.
     @Transient
     val isLikedByCurrentUser: Boolean = false,
 
     @Transient
     val isFavoritedByCurrentUser: Boolean = false
 ) {
-    // Helper property: Returns mediaUrls if non-empty, otherwise falls back to single mediaUrl
+    /** Resolved image list, preferring [mediaUrls] with fallback to [mediaUrl]. */
     val allMediaUrls: List<String>
         get() = if (mediaUrls.isNotEmpty()) mediaUrls else listOfNotNull(mediaUrl.ifEmpty { null })
 }
 
-// 2. Track who liked which post
+/** Like record linking a user to a post. */
 @Serializable
 data class PostLike(
     @SerialName("post_id") val postId: String,
@@ -72,7 +78,7 @@ data class PostLike(
     @SerialName("user_profile_pic_url") val userProfilePicUrl: String? = null
 )
 
-// 3. Track saved/bookmarked posts for Profile
+/** Saved-post record for the profile collection. */
 @Serializable
 data class PostFavorite(
     @SerialName("post_id") val postId: String,

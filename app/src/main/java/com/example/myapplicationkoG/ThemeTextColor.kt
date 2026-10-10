@@ -6,8 +6,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.luminance
 
 /**
- * Keeps the app's current brand colour in light mode and makes text white
- * when the currently selected app theme is dark.
+ * Returns [lightModeColor] in light mode and white in dark mode.
  */
 @Composable
 fun textColorForTheme(lightModeColor: Color): Color {

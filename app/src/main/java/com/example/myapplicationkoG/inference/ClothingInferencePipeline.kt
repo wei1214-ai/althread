@@ -6,14 +6,12 @@ import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.util.Log
-import org.opencv.core.CvType
-import org.opencv.core.Mat
-import org.opencv.core.Scalar
-import org.opencv.imgproc.Imgproc
+import com.example.myapplicationkoG.CutoutRepository
+import java.io.ByteArrayOutputStream
 import java.io.File
 
 /**
- * Result of the on-device cutout pipeline for a single garment photo.
+ * Result of the cloud cutout pipeline for a single garment photo.
  * Only the final cutout bitmap matters for now.
  */
 data class InferenceResult(
@@ -21,26 +19,33 @@ data class InferenceResult(
 )
 
 /**
- * Pipeline:
- *   photo file → decode → cloth U2NET mask → cut out + center on 1080x1080
+ * Cloud cutout pipeline: photo file → downscale → JPEG80 → `cutout` Edge Function
+ * → merge garment masks → fill holes → cut out and center on a 1080x1080 canvas.
  *
- * U2NET only. YOLO and SAM have been removed from the project.
+ * Requires network; callers surface failures instead of silently skipping.
  *
- * Runs on Dispatchers.IO. No deskew, no contour math — just the AI
- * cutout blended onto a white canvas.
+ * Runs on Dispatchers.IO (CutoutRepository switches internally).
  */
 class ClothingInferencePipeline(context: Context) {
 
     private val appContext = context.applicationContext
-    private val clothNet = U2NetClothSegmenter(appContext)
+    private val cutoutRepo = CutoutRepository()
 
     suspend fun run(file: File): InferenceResult {
         val sourceBitmap = decodeScaled(file, maxEdge = 1280)
         try {
-            val clothFile = runCatching { clothNet.modelFile() }.getOrNull()
-                ?: error("cloth_segmentation.onnx missing. Please add the model to assets.")
-            Log.d("ClothingPipeline", "U2NET model=${clothFile.absolutePath}")
-            var mask = clothNet.segment(sourceBitmap)
+            val jpeg = bitmapToJpegBytes(sourceBitmap, quality = 80)
+            val (polys, respSize, topGarment) = runCatching { cutoutRepo.fetchPolygons(jpeg) }.getOrElse { e ->
+                throw mapNetworkError(e)
+            }
+            Log.d("ClothingPipeline", "cloud polys=${polys.size} top=$topGarment")
+            var mask = rasterizePolygons(
+                polys,
+                srcW = respSize.first.takeIf { it > 0 } ?: sourceBitmap.width,
+                srcH = respSize.second.takeIf { it > 0 } ?: sourceBitmap.height,
+                outW = sourceBitmap.width,
+                outH = sourceBitmap.height
+            )
             try {
                 // Fill interior holes (e.g. white T-shirt pattern predicted as background)
                 val filled = fillMaskHoles(mask)
@@ -49,14 +54,14 @@ class ClothingInferencePipeline(context: Context) {
                     mask = filled
                 }
                 val coverage = maskCoverage(mask)
-                if (coverage < 0.20f) {
+                // Reject only near-empty masks; small garments and partial fills are valid.
+                if (coverage < 0.08f) {
                     error("Invalid photo: garment not fully visible. Please lay the garment flat and fill the frame.")
                 }
-                Log.d("ClothingPipeline", "U2NET coverage=$coverage")
+                Log.d("ClothingPipeline", "cloud coverage=$coverage")
                 val cutout = cutoutOntoCanvas(sourceBitmap, mask, canvasSize = 1080)
                 return InferenceResult(cutout = cutout)
             } finally {
-                // mask is ARGB with alpha channel, recycle after use
                 runCatching { if (!mask.isRecycled) mask.recycle() }
             }
         } finally {
@@ -64,36 +69,101 @@ class ClothingInferencePipeline(context: Context) {
         }
     }
 
+    /** Raw network failures become a human "need internet" message. */
+    private fun mapNetworkError(e: Throwable): Throwable {
+        val msg = e.message.orEmpty()
+        val offline = e is java.io.IOException ||
+            e is java.net.UnknownHostException ||
+            e is java.net.SocketTimeoutException ||
+            msg.contains("Unable to resolve host", ignoreCase = true) ||
+            msg.contains("timeout", ignoreCase = true) ||
+            msg.contains("Failed to connect", ignoreCase = true)
+        return if (offline) {
+            IOExceptionNoNetwork("No internet connection. Cutout needs network — check connection and retry.")
+        } else e
+    }
+
+    class IOExceptionNoNetwork(message: String) : java.io.IOException(message)
+
+    private fun bitmapToJpegBytes(bmp: Bitmap, quality: Int): ByteArray {
+        val out = ByteArrayOutputStream()
+        out.use { bmp.compress(Bitmap.CompressFormat.JPEG, quality, it) }
+        return out.toByteArray()
+    }
+
+    /**
+     * Rasterize Roboflow polygons into one white-on-black alpha bitmap.
+     * Roboflow points are (usually) in source pixel space; srcW/srcH rescale
+     * defensively in case the service returns a resized coordinate space.
+     */
+    private fun rasterizePolygons(
+        polys: List<com.example.myapplicationkoG.CutoutPolygon>,
+        srcW: Int,
+        srcH: Int,
+        outW: Int,
+        outH: Int
+    ): Bitmap {
+        val out = Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(out)
+        canvas.drawColor(Color.BLACK)
+        val paint = android.graphics.Paint().apply {
+            color = Color.WHITE
+            style = android.graphics.Paint.Style.FILL
+            isAntiAlias = true
+        }
+        val sx = if (srcW > 0) outW.toFloat() / srcW else 1f
+        val sy = if (srcH > 0) outH.toFloat() / srcH else 1f
+        for (poly in polys) {
+            if (poly.points.size < 3) continue
+            val path = android.graphics.Path()
+            poly.points.forEachIndexed { i, pt ->
+                val x = (pt.x * sx).coerceIn(0f, outW.toFloat())
+                val y = (pt.y * sy).coerceIn(0f, outH.toFloat())
+                if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+            }
+            path.close()
+            canvas.drawPath(path, paint)
+        }
+        // Convert to alpha mask: white fill -> full alpha.
+        val px = IntArray(outW * outH)
+        out.getPixels(px, 0, outW, 0, 0, outW, outH)
+        for (i in px.indices) {
+            val white = px[i] and 0x00FFFFFF
+            px[i] = if (white != 0) (0xFF shl 24) or 0x00FFFFFF else (0x00 shl 24)
+        }
+        out.setPixels(px, 0, outW, 0, 0, outW, outH)
+        return out
+    }
+
     private fun decodeScaled(file: File, maxEdge: Int): Bitmap {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(file.absolutePath, bounds)
         val (w, h) = bounds.outWidth to bounds.outHeight
         if (w <= 0 || h <= 0) error("Could not decode image: ${file.absolutePath}")
+        return decodeScaledBounds(file.absolutePath, w, h, maxEdge)
+    }
 
-        var sample = 1
-        while (w / sample > maxEdge || h / sample > maxEdge) sample *= 2
-        val opts = BitmapFactory.Options().apply {
-            inSampleSize = sample
-            inPreferredConfig = Bitmap.Config.ARGB_8888
+    private fun decodeScaledBounds(path: String, w: Int, h: Int, maxEdge: Int): Bitmap {
+        val longEdge = maxOf(w, h)
+        if (longEdge <= maxEdge) {
+            return BitmapFactory.decodeFile(path)
+                ?: error("Could not decode image: $path")
         }
-        val bmp = BitmapFactory.decodeFile(file.absolutePath, opts)
-            ?: error("Could not decode image: ${file.absolutePath}")
-        val longEdge = maxOf(bmp.width, bmp.height)
-        return if (longEdge > maxEdge) {
-            val scale = maxEdge.toFloat() / longEdge
-            val scaled = Bitmap.createScaledBitmap(
-                bmp,
-                (bmp.width * scale).toInt(),
-                (bmp.height * scale).toInt(),
-                true,
-            )
-            if (scaled !== bmp) bmp.recycle()
-            scaled
-        } else bmp
+        val scale = maxEdge.toFloat() / longEdge
+        val bmp = BitmapFactory.decodeFile(path)
+            ?: error("Could not decode image: $path")
+        val scaled = Bitmap.createScaledBitmap(
+            bmp,
+            (bmp.width * scale).toInt(),
+            (bmp.height * scale).toInt(),
+            true,
+        )
+        if (scaled !== bmp) bmp.recycle()
+        return scaled
     }
 
     /**
-     * Use the SAM mask to cut the garment out of the original photo and
+     * Use the merged mask to cut the garment out of the original photo and
      * center-fit it on a 1080x1080 white canvas.
      */
     private fun cutoutOntoCanvas(
@@ -101,8 +171,6 @@ class ClothingInferencePipeline(context: Context) {
         maskArgb: Bitmap,
         canvasSize: Int,
     ): Bitmap {
-        // 1) Make a transparent-background cutout of the source bitmap
-        //    using the SAM mask as the alpha channel.
         val srcW = source.width
         val srcH = source.height
         val maskResized = if (maskArgb.width != srcW || maskArgb.height != srcH) {
@@ -116,30 +184,11 @@ class ClothingInferencePipeline(context: Context) {
         maskResized.getPixels(maskPx, 0, srcW, 0, 0, srcW, srcH)
         for (i in srcPx.indices) {
             val alpha = (maskPx[i] ushr 24) and 0xFF
-            // Keep feathered alpha from SAM (0-255) for anti-aliased edge
             srcPx[i] = (alpha shl 24) or (srcPx[i] and 0x00FFFFFF)
         }
         cut.setPixels(srcPx, 0, srcW, 0, 0, srcW, srcH)
         if (maskResized !== maskArgb) maskResized.recycle()
 
-        // 2) Center-fit the cutout on a 1080x1080 white canvas.
-        // Prefer pure Android Canvas (no native dependency) to avoid alpha loss that OpenCV 3-channel Mat caused.
-        // Keep OpenCV path as fallback but fixed to 4-channel handling.
-        return try {
-            if (isOpenCVReady()) {
-                cutoutViaOpenCV(cut, canvasSize)
-            } else {
-                cutoutViaCanvas(cut, canvasSize)
-            }
-        } catch (t: Throwable) {
-            Log.w("ClothingPipeline", "OpenCV path failed, fallback to Canvas: ${t.message}", t)
-            cutoutViaCanvas(cut, canvasSize)
-        } finally {
-            runCatching { if (!cut.isRecycled) cut.recycle() }
-        }
-    }
-
-    private fun cutoutViaCanvas(cut: Bitmap, canvasSize: Int): Bitmap {
         val ratio = minOf(
             canvasSize.toFloat() / cut.width,
             canvasSize.toFloat() / cut.height
@@ -150,118 +199,10 @@ class ClothingInferencePipeline(context: Context) {
         val out = Bitmap.createBitmap(canvasSize, canvasSize, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(out)
         canvas.drawColor(Color.WHITE)
-        val left = (canvasSize - newW) / 2f
-        val top = (canvasSize - newH) / 2f
-        canvas.drawBitmap(scaled, left, top, null)
+        canvas.drawBitmap(scaled, (canvasSize - newW) / 2f, (canvasSize - newH) / 2f, null)
         if (scaled !== cut) scaled.recycle()
+        runCatching { if (!cut.isRecycled) cut.recycle() }
         return out
-    }
-
-    private fun cutoutViaOpenCV(cut: Bitmap, canvasSize: Int): Bitmap {
-        // Fixed 4-channel path: preserve alpha, then composite onto white 3-channel canvas using mask
-        val cutMat4 = bitmapToBgraMat(cut) // 4 channels
-        val canvasMat = Mat(canvasSize, canvasSize, CvType.CV_8UC3, Scalar.all(255.0))
-        try {
-            // Split 4 channels to get alpha mask
-            val channels = mutableListOf<Mat>()
-            org.opencv.core.Core.split(cutMat4, channels) // B,G,R,A
-            val alpha = channels[3]
-            // Create 3-channel BGR from first 3 channels
-            val bgr = Mat()
-            org.opencv.core.Core.merge(channels.subList(0, 3), bgr)
-
-            val ratio = minOf(
-                canvasSize.toDouble() / bgr.cols(),
-                canvasSize.toDouble() / bgr.rows(),
-            ).coerceAtLeast(1e-6)
-            val newW = (bgr.cols() * ratio).toInt().coerceAtLeast(1)
-            val newH = (bgr.rows() * ratio).toInt().coerceAtLeast(1)
-            val fittedBgr = Mat()
-            val fittedAlpha = Mat()
-            Imgproc.resize(bgr, fittedBgr, org.opencv.core.Size(newW.toDouble(), newH.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
-            Imgproc.resize(alpha, fittedAlpha, org.opencv.core.Size(newW.toDouble(), newH.toDouble()), 0.0, 0.0, Imgproc.INTER_LINEAR)
-            try {
-                val x = (canvasSize - newW) / 2
-                val y = (canvasSize - newH) / 2
-                val roi = canvasMat.submat(y, y + newH, x, x + newW)
-                try {
-                    // Copy only where alpha >127
-                    // threshold alpha to binary
-                    val maskBinary = Mat()
-                    Imgproc.threshold(fittedAlpha, maskBinary, 127.0, 255.0, Imgproc.THRESH_BINARY)
-                    try {
-                        fittedBgr.copyTo(roi, maskBinary)
-                    } finally {
-                        maskBinary.release()
-                    }
-                } finally {
-                    roi.release()
-                }
-            } finally {
-                fittedBgr.release()
-                fittedAlpha.release()
-                bgr.release()
-                alpha.release()
-                for (c in channels) c.release()
-            }
-            return bgrMatToBitmap(canvasMat)
-        } finally {
-            cutMat4.release()
-            canvasMat.release()
-        }
-    }
-
-    private fun bitmapToBgrMat(bitmap: Bitmap): Mat {
-        val w = bitmap.width
-        val h = bitmap.height
-        val pixels = IntArray(w * h)
-        bitmap.getPixels(pixels, 0, w, 0, 0, w, h)
-        val mat = Mat(h, w, CvType.CV_8UC3)
-        val data = ByteArray(w * h * 3)
-        var i = 0
-        for (p in pixels) {
-            data[i++] = (p and 0xFF).toByte() // B
-            data[i++] = ((p shr 8) and 0xFF).toByte()  // G
-            data[i++] = ((p shr 16) and 0xFF).toByte()  // R
-        }
-        mat.put(0, 0, data)
-        return mat
-    }
-
-    private fun bitmapToBgraMat(bitmap: Bitmap): Mat {
-        val w = bitmap.width
-        val h = bitmap.height
-        val pixels = IntArray(w * h)
-        bitmap.getPixels(pixels, 0, w, 0, 0, w, h)
-        val mat = Mat(h, w, CvType.CV_8UC4)
-        val data = ByteArray(w * h * 4)
-        var i = 0
-        for (p in pixels) {
-            data[i++] = (p and 0xFF).toByte() // B
-            data[i++] = ((p shr 8) and 0xFF).toByte()  // G
-            data[i++] = ((p shr 16) and 0xFF).toByte()  // R
-            data[i++] = ((p ushr 24) and 0xFF).toByte() // A
-        }
-        mat.put(0, 0, data)
-        return mat
-    }
-
-    private fun bgrMatToBitmap(mat: Mat): Bitmap {
-        val w = mat.cols()
-        val h = mat.rows()
-        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        val data = ByteArray(w * h * 3)
-        mat.get(0, 0, data)
-        val pixels = IntArray(w * h)
-        var i = 0
-        for (p in pixels.indices) {
-            val b = data[i++].toInt() and 0xFF
-            val g = data[i++].toInt() and 0xFF
-            val r = data[i++].toInt() and 0xFF
-            pixels[p] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
-        }
-        bmp.setPixels(pixels, 0, w, 0, 0, w, h)
-        return bmp
     }
 
     private fun maskCoverage(mask: Bitmap): Float {
@@ -275,9 +216,8 @@ class ClothingInferencePipeline(context: Context) {
     }
 
     /**
-     * Fill interior holes in SAM mask so inner patterns are kept.
-     * White T-shirt pattern is often predicted as background hole;
-     * flood fill from borders marks true background, the rest is garment.
+     * Fill interior holes in the mask so inner patterns are kept.
+     * Flood fill from borders marks true background, the rest is garment.
      */
     private fun fillMaskHoles(mask: Bitmap): Bitmap {
         val w = mask.width
@@ -330,31 +270,5 @@ class ClothingInferencePipeline(context: Context) {
         val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         out.setPixels(pixels, 0, w, 0, 0, w, h)
         return out
-    }
-
-    companion object {
-        @Volatile private var opencvInited: Boolean? = null
-
-        private fun isOpenCVReady(): Boolean {
-            opencvInited?.let { return it }
-            val ready = try {
-                System.loadLibrary("opencv_java4")
-                true
-            } catch (_: Throwable) {
-                try {
-                    System.loadLibrary("opencv_java4100")
-                    true
-                } catch (_: Throwable) {
-                    try {
-                        org.opencv.android.OpenCVLoader.initDebug()
-                    } catch (_: Throwable) {
-                        false
-                    }
-                }
-            }
-            opencvInited = ready
-            if (!ready) Log.w("ClothingPipeline", "OpenCV not available, using Canvas fallback")
-            return ready
-        }
     }
 }

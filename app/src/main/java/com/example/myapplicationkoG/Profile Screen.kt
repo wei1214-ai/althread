@@ -65,6 +65,7 @@ import com.example.myapplicationkoG.ui.UserProfile
 import com.example.myapplicationkoG.ui.theme.Cyan
 import com.example.myapplicationkoG.ui.theme.MidnightBlue
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.CancellationException
 import coil.ImageLoader
 import coil.request.ImageRequest
 import coil.decode.VideoFrameDecoder
@@ -138,6 +139,14 @@ fun ProfileScreen(
     }
     val scope = rememberCoroutineScope()
 
+    // Internal Compose errors (screen navigated away mid-load) are not surfaced
+    // as user-facing errors; the profile itself loaded fine.
+    fun showRealError(e: Throwable, fallback: String) {
+        if (e is CancellationException) return
+        if (e.message?.contains("left the composition", ignoreCase = true) == true) return
+        errorMessage = e.message ?: fallback
+    }
+
     var selectedTabIndex by remember { mutableIntStateOf(0) }
     var savedPosts by remember { mutableStateOf<List<Post>>(emptyList()) }
     var isSavedLoading by remember { mutableStateOf(false) }
@@ -153,26 +162,31 @@ fun ProfileScreen(
         contract = ActivityResultContracts.GetContent()
     ) { imageUri ->
         if (imageUri != null) {
-            scope.launch {
-                try {
-                    repository.uploadAvatar(context, imageUri)
-                    profile = repository.getMyProfile()
-                } catch (e: Exception) {
-                    errorMessage = e.message ?: "Could not upload avatar"
+            runCatching {
+                scope.launch {
+                    try {
+                        repository.uploadAvatar(context, imageUri)
+                        profile = repository.getMyProfile()
+                        errorMessage = ""
+                    } catch (e: Exception) {
+                        showRealError(e, "Could not upload avatar")
+                    }
                 }
             }
         }
     }
 
-    // Helper to refresh posts and count after deletion
     fun refreshMyPosts(userId: String) {
-        scope.launch {
-            try {
-                val allPosts = postRepository.getPosts(category = "All")
-                myPosts = allPosts.filter { post -> post.userId == userId }
-                postCount = postRepository.getPostCount(userId)
-            } catch (e: Exception) {
-                errorMessage = e.message ?: "Could not refresh posts"
+        runCatching {
+            scope.launch {
+                try {
+                    val allPosts = postRepository.getPosts(category = "All")
+                    myPosts = allPosts.filter { post -> post.userId == userId }
+                    postCount = postRepository.getPostCount(userId)
+                    errorMessage = ""
+                } catch (e: Exception) {
+                    showRealError(e, "Could not refresh posts")
+                }
             }
         }
     }
@@ -190,8 +204,9 @@ fun ProfileScreen(
             postCount = postRepository.getPostCount(loadedProfile.id)
             followerCount = followRepository.getFollowerCount(loadedProfile.id)
             followingCount = followRepository.getFollowingCount(loadedProfile.id)
+            errorMessage = ""
         } catch (e: Exception) {
-            errorMessage = e.message ?: "Could not load profile"
+            showRealError(e, "Could not load profile")
         } finally {
             isMyPostsLoading = false
         }
@@ -204,19 +219,26 @@ fun ProfileScreen(
             try {
                 savedPosts = postRepository.getFavouritePosts()
             } catch (e: Exception) {
-                errorMessage = e.message ?: "Could not load saved posts"
+                showRealError(e, "Could not load saved posts")
             } finally {
                 isSavedLoading = false
             }
         }
     }
 
-    // Detail Modal Dialog when post thumbnail is clicked
     selectedPostForDetail?.let { selectedPost ->
         Dialog(onDismissRequest = {
             selectedPostForDetail = null
             if (selectedTabIndex == 1) {
-                scope.launch { savedPosts = postRepository.getFavouritePosts() }
+                runCatching {
+                    scope.launch {
+                        try {
+                            savedPosts = postRepository.getFavouritePosts()
+                        } catch (e: Exception) {
+                            showRealError(e, "Could not load saved posts")
+                        }
+                    }
+                }
             }
         }) {
             Box(
@@ -227,14 +249,11 @@ fun ProfileScreen(
                 PostCard(
                     post = selectedPost,
                     onDeletePost = { deletedPost ->
-                        // 1. Close modal immediately
+                        // Optimistic delete: close the dialog and drop the post from the
+                        // grid immediately, then reconcile with the backend afterwards.
                         selectedPostForDetail = null
-
-                        // 2. Remove post from UI state instantly
                         myPosts = myPosts.filter { it.id != deletedPost.id }
                         postCount = (postCount - 1).coerceAtLeast(0)
-
-                        // 3. Sync with backend DB
                         profile?.let { currentProfile ->
                             refreshMyPosts(currentProfile.id)
                         }
@@ -257,7 +276,7 @@ fun ProfileScreen(
             Column {
                 Box(
                     modifier = Modifier
-                        .size(40.dp)
+                        .size(48.dp)
                         .clip(shape = RoundedCornerShape(size = 12.dp))
                         .background(color = Cyan)
                         .align(Alignment.End),
@@ -268,7 +287,7 @@ fun ProfileScreen(
                             painter = painterResource(id = R.drawable.setting),
                             contentDescription = "Settings",
                             tint = MidnightBlue,
-                            modifier = Modifier.size(30.dp)
+                            modifier = Modifier.size(24.dp)
                         )
                     }
                 }
@@ -290,7 +309,7 @@ fun ProfileScreen(
                             modifier = Modifier
                                 .align(Alignment.BottomEnd)
                                 .size(36.dp)
-                                .clip(RoundedCornerShape(12.dp))
+                                .clip(CircleShape)
                                 .background(Cyan)
                         ) {
                             Icon(
@@ -506,7 +525,12 @@ fun ProfileScreen(
                                 }
                         ) {
                             AsyncImage(
-                                model = coverUrl,
+                                model = ImageRequest.Builder(context)
+                                    .data(coverUrl)
+                                    .videoFrameMillis(1_000)
+                                    .crossfade(true)
+                                    .build(),
+                                imageLoader = thumbnailImageLoader,
                                 contentDescription = post.clothingTitle,
                                 contentScale = ContentScale.Crop,
                                 modifier = Modifier.fillMaxSize()

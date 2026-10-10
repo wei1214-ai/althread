@@ -2,6 +2,9 @@ package com.example.myapplicationkoG.ui.editor
 
 import com.example.myapplicationkoG.domain.model.GarmentSideId
 
+/**
+ * Dye and button state for one editor session, keyed per garment side.
+ */
 data class LoadedDesign(
     val dye: Map<GarmentSideId, DyeState>,
     val buttons: Map<GarmentSideId, List<PlacedButton>>
@@ -18,6 +21,10 @@ internal object SessionHolder {
     @Volatile var challengeDescription: String? = null
 }
 
+/**
+ * Stages the last saved dye/button state while leaving the editor, and hands it
+ * back exactly once on return. Stage before navigating away; consume on entry.
+ */
 object DesignSession {
     private var pending: LoadedDesign?
         get() = SessionHolder.pendingDesign
@@ -32,8 +39,14 @@ object DesignSession {
         pending = null
         return p
     }
+
+    fun clear() { pending = null }
 }
 
+/**
+ * One-shot handoff of the challenge being responded to, cleared on consume so a
+ * recomposition or back-navigation cannot replay it.
+ */
 object ChallengeSession {
     var postId: String?
         get() = SessionHolder.challengePostId
@@ -67,4 +80,10 @@ object ChallengeSession {
 
     fun peek(): Triple<String?, String?, String?> = Triple(postId, title, description)
     fun peekPair(): Pair<String?, String?> = title to description
+
+    fun clear() {
+        postId = null
+        title = null
+        description = null
+    }
 }

@@ -106,8 +106,19 @@ fun ContinueDesignsScreen(
                     val row = deleteTarget!!
                     deleteTarget = null
                     scope.launch {
-                        repo.deleteDesign(context, row)
-                        designs = designs.filter { it.id != row.id }
+                        try {
+                            repo.deleteDesign(context, row)
+                            // Only mutate UI state after the server confirms.
+                            designs = designs.filter { it.id != row.id }
+                            thumbs = thumbs - row.id
+                        } catch (e: Exception) {
+                            e.printStackTrace()
+                            android.widget.Toast.makeText(
+                                context,
+                                "Delete failed: ${e.message ?: "network error"}",
+                                android.widget.Toast.LENGTH_LONG
+                            ).show()
+                        }
                     }
                 }) { Text("Delete", color = Color.Red) }
             },

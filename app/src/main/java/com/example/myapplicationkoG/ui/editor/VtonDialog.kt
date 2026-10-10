@@ -6,6 +6,8 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -33,6 +35,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -45,32 +48,47 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.material3.MaterialTheme
 import coil.compose.AsyncImage
-import com.example.myapplicationkoG.VtonRepository
 import com.example.myapplicationkoG.textColorForTheme
 import com.example.myapplicationkoG.ui.theme.Cyan
 import com.example.myapplicationkoG.ui.theme.MidnightBlue
 import kotlinx.coroutines.launch
 import java.io.File
 
+/**
+ * Virtual try-on dialog: picks a person photo, starts a run and shows the result.
+ *
+ * Ownership and lifecycle: the run lives in [com.example.myapplicationkoG.ui.garmentinput.GarmentInputViewModel],
+ * not here. This dialog only observes `vtonRunning` / `vtonResultPath`, so rotation
+ * recreates the UI while the run continues and its result survives. Nothing is
+ * cancelled on dispose - cancel happens only via the Cancel button or a real
+ * dismiss, both of which route through the ViewModel and also clear temp files.
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun VtonDialog(
     garmentFile: File?,
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
+    viewModel: com.example.myapplicationkoG.ui.garmentinput.GarmentInputViewModel
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    val repo = remember { VtonRepository() }
+
+    val running by viewModel.vtonRunning.collectAsStateWithLifecycle()
+    val resultPath by viewModel.vtonResultPath.collectAsStateWithLifecycle()
+    val resultFile = resultPath?.let { java.io.File(it) }?.takeIf { it.exists() }
 
     var personUri by remember { mutableStateOf<Uri?>(null) }
-    var running by remember { mutableStateOf(false) }
-    var resultFile by remember { mutableStateOf<File?>(null) }
     var saving by remember { mutableStateOf(false) }
+
+    fun cancelRun() {
+        // Cancels both Job and socket; either alone leaves the run half-alive.
+        viewModel.cancelVtonRun()
+        Toast.makeText(context, "Cancelled", Toast.LENGTH_SHORT).show()
+    }
 
     val pickPerson = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
         uri?.let {
             personUri = it
-            resultFile = null
         }
     }
 
@@ -82,7 +100,11 @@ fun VtonDialog(
                 .background(MaterialTheme.colorScheme.surface)
                 .padding(20.dp)
         ) {
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            // Scrollable: pickers + button exceed landscape height (~360dp).
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                modifier = Modifier.verticalScroll(androidx.compose.foundation.rememberScrollState())
+            ) {
                 Text("Virtual Try-On", fontWeight = FontWeight.ExtraBold, fontSize = 18.sp, color = textColorForTheme(MidnightBlue))
                 Spacer(modifier = Modifier.height(12.dp))
 
@@ -147,6 +169,10 @@ fun VtonDialog(
                         Spacer(modifier = Modifier.padding(4.dp))
                         Text("Trying on... (free queue, ~1-2 min)", fontSize = 13.sp, color = textColorForTheme(Color.Gray))
                     }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    TextButton(onClick = { cancelRun() }) {
+                        Text("Cancel try-on", color = textColorForTheme(Color.Gray), fontWeight = FontWeight.Bold)
+                    }
                 } else if (resultFile != null) {
                     AsyncImage(
                         model = resultFile,
@@ -158,10 +184,17 @@ fun VtonDialog(
                     Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                         TextButton(
                             onClick = {
+                                // Snapshot before launching: a new run or dismiss
+                                // can null resultFile before the coroutine starts.
+                                val fileToSave = resultFile
+                                if (fileToSave == null || !fileToSave.exists()) {
+                                    Toast.makeText(context, "Result expired, please run try-on again", Toast.LENGTH_SHORT).show()
+                                    return@TextButton
+                                }
                                 saving = true
                                 scope.launch {
                                     try {
-                                        repo.saveToGallery(context, resultFile!!, "tryon_${System.currentTimeMillis()}")
+                                        viewModel.vtonRepo.saveToGallery(context, fileToSave, "tryon_${System.currentTimeMillis()}")
                                         Toast.makeText(context, "Saved to gallery", Toast.LENGTH_SHORT).show()
                                     } catch (e: Exception) {
                                         Toast.makeText(context, "Save failed: ${e.message}", Toast.LENGTH_SHORT).show()
@@ -189,19 +222,20 @@ fun VtonDialog(
                                 Toast.makeText(context, "No garment image", Toast.LENGTH_SHORT).show()
                                 return@Button
                             }
-                            running = true
-                            scope.launch {
-                                try {
-                                    val personFile = File(context.cacheDir, "vton_person_${System.currentTimeMillis()}.jpg")
-                                    context.contentResolver.openInputStream(personUri!!)?.use { input ->
-                                        personFile.outputStream().use { input.copyTo(it) }
-                                    }
-                                    resultFile = repo.runTryOn(personFile, garmentFile!!)
-                                } catch (e: Exception) {
-                                    Toast.makeText(context, "Try-on failed: ${e.message}", Toast.LENGTH_LONG).show()
-                                } finally {
-                                    running = false
+                            val personFile = File(context.cacheDir, "vton_person_${System.currentTimeMillis()}.jpg")
+                            try {
+                                context.contentResolver.openInputStream(personUri!!)?.use { input ->
+                                    personFile.outputStream().use { input.copyTo(it) }
                                 }
+                            } catch (e: Exception) {
+                                runCatching { personFile.delete() }
+                                Toast.makeText(context, "Could not read photo", Toast.LENGTH_SHORT).show()
+                                return@Button
+                            }
+                            // Ownership passes to the ViewModel: survives rotation
+                            // and is cleaned up on a real dismiss.
+                            viewModel.startVtonRun(personFile, garmentFile!!) { msg ->
+                                Toast.makeText(context, "Try-on failed: $msg", Toast.LENGTH_LONG).show()
                             }
                         },
                         modifier = Modifier.fillMaxWidth().height(50.dp),

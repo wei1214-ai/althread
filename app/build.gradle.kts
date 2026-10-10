@@ -8,7 +8,12 @@ plugins {
 }
 
 kotlin {
-    jvmToolchain(20)
+    // Bytecode pinned to 17: D8/R8 in AGP 8.7 cannot digest v64+ (JDK20/21) classes.
+    // No pinned toolchain on purpose — any JDK 17+ running Gradle works
+    // (Studio JBR 21, JDK 20, CI JDK 17); output is always v61.
+    compilerOptions {
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+    }
 }
 
 android {
@@ -33,6 +38,20 @@ android {
         buildConfigField("String", "OPENROUTER_API_KEY", "\"$openrouterKey\"")
         // HF tokens no longer baked into APK - VTON now proxies via Supabase Edge Function (AIConfig.VTON_URL)
         // Secrets are stored in Supabase Vault, not in BuildConfig.
+        // Supabase publishable credentials: local.properties > -P gradle prop > env.
+        // local.properties is gitignored. No real fallback values here on purpose:
+        // committed defaults would ship in git history and every APK (decompilable).
+        // A blank value fails fast at startup with a clear message instead.
+        val supabaseUrl: String = (localProps.getProperty("supabaseUrl") as String?)
+            ?: (project.findProperty("supabaseUrl") as String?)
+            ?: System.getenv("SUPABASE_URL")
+            ?: ""
+        val supabaseKey: String = (localProps.getProperty("supabaseKey") as String?)
+            ?: (project.findProperty("supabaseKey") as String?)
+            ?: System.getenv("SUPABASE_KEY")
+            ?: ""
+        buildConfigField("String", "SUPABASE_URL", "\"$supabaseUrl\"")
+        buildConfigField("String", "SUPABASE_KEY", "\"$supabaseKey\"")
     }
 
     buildTypes {
@@ -45,9 +64,9 @@ android {
     }
 
     compileOptions {
-        // Keep consistent with jvmToolchain(20)
-        sourceCompatibility = JavaVersion.VERSION_20
-        targetCompatibility = JavaVersion.VERSION_20
+        // Must stay 17 — see kotlin jvmTarget above.
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
     }
 
     buildFeatures {
@@ -63,15 +82,15 @@ android {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
     }
-
-    // Keep ONNX models uncompressed so on-device inference can mmap them.
-    aaptOptions {
-        noCompress += "onnx"
-    }
 }
 
 dependencies {
-    implementation("io.coil-kt:coil-video:2.6.0")
+    // Lifecycle / core (required by ContextCompat, FileProvider, collectAsStateWithLifecycle, viewModelScope)
+    implementation(libs.androidx.core.ktx)
+    implementation(libs.androidx.lifecycle.runtime.ktx)
+    implementation(libs.androidx.lifecycle.runtime.compose)
+    implementation(libs.androidx.lifecycle.viewmodel.compose)
+
     // Crop pics
     implementation("com.github.yalantis:ucrop:2.2.11")
     implementation("androidx.appcompat:appcompat:1.7.1")
@@ -87,11 +106,11 @@ dependencies {
     implementation("io.ktor:ktor-client-android:3.0.1")
 
     // Kotlinx Serialization JSON
-    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")
+    implementation(libs.kotlinx.serialization.json)
 
-    // Coil & Video Frame Support
+    // Coil & Video Frame Support (keep same version to avoid NoSuchMethodError)
     implementation(libs.coil.compose)
-    implementation("io.coil-kt:coil-video:2.6.0")
+    implementation(libs.coil.video)
 
     // Activity & Compose UI
     implementation(libs.activity.compose)
@@ -120,13 +139,13 @@ dependencies {
     // Coroutines
     implementation(libs.kotlinx.coroutines.android)
 
-    // On-device inference: YOLO + SAM 2.1
-    implementation(libs.onnxruntime.android)
-    implementation(libs.opencv)
+    // NOTE: on-device inference removed — cutout now runs in the cloud
+    // (`cutout` Edge Function, segformer). onnxruntime + opencv deps deleted
+    // with the 169MB bundled model. Bitmap compositing is pure Android Canvas.
 
-    // Media3 ExoPlayer dependencies for video playback
-    implementation("androidx.media3:media3-exoplayer:1.2.1")
-    implementation("androidx.media3:media3-ui:1.2.1")
+    // Media3 ExoPlayer dependencies for video playback (must match compileSdk 35)
+    implementation(libs.media3.exoplayer)
+    implementation(libs.media3.ui)
 
     // Test
     testImplementation(libs.junit)

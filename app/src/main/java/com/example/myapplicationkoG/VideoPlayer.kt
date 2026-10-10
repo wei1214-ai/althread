@@ -11,6 +11,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
+import androidx.media3.common.VideoSize
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.AspectRatioFrameLayout
@@ -24,24 +25,40 @@ import androidx.media3.ui.PlayerView
 @Composable
 fun VideoPlayer(
     videoUrl: String,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    autoPlay: Boolean = false,
+    // FIT shows the full frame (no crop). The feed box already adapts to the
+    // video aspect via onVideoSizeChanged, so no black bars in practice.
+    resizeMode: Int = AspectRatioFrameLayout.RESIZE_MODE_FIT,
+    onVideoSizeChanged: ((width: Int, height: Int) -> Unit)? = null
 ) {
-    val context = LocalContext.current
+    val appContext = LocalContext.current.applicationContext
 
     // Initialize ExoPlayer instance for video rendering
+    // Use applicationContext to avoid leaking Activity on rotation.
     val exoPlayer = remember(videoUrl) {
-        ExoPlayer.Builder(context).build().apply {
+        ExoPlayer.Builder(appContext).build().apply {
             val mediaItem = MediaItem.fromUri(Uri.parse(videoUrl))
             setMediaItem(mediaItem)
             repeatMode = Player.REPEAT_MODE_ONE // Loop video endlessly
             prepare()
-            playWhenReady = true // Auto-start video playback
+            playWhenReady = autoPlay // Default paused: feed must not autoplay all videos
         }
     }
 
     // Release player memory when component leaves screen
     DisposableEffect(videoUrl) {
+        val sizeListener = object : Player.Listener {
+            override fun onVideoSizeChanged(videoSize: VideoSize) {
+                if (videoSize.width > 0 && videoSize.height > 0) {
+                    onVideoSizeChanged?.invoke(videoSize.width, videoSize.height)
+                }
+            }
+        }
+        exoPlayer.addListener(sizeListener)
         onDispose {
+            runCatching { exoPlayer.removeListener(sizeListener) }
+            runCatching { exoPlayer.pause() }
             exoPlayer.stop()
             exoPlayer.release()
         }
@@ -53,14 +70,16 @@ fun VideoPlayer(
             PlayerView(ctx).apply {
                 player = exoPlayer
                 useController = false // Hide playback controls for clean Feed UI
-                // 💡 Center Crop (Aspect Ratio Zoom) to fill the 300dp container smoothly without black bars
-                resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+                setResizeMode(resizeMode)
             }
         },
         update = { playerView ->
-            // 💡 Ensure the player remains bound even if Compose reuses the view
+            // Rebind the player if Compose recycled the underlying view.
             if (playerView.player != exoPlayer) {
                 playerView.player = exoPlayer
+            }
+            if (playerView.resizeMode != resizeMode) {
+                playerView.setResizeMode(resizeMode)
             }
         },
         modifier = modifier.fillMaxSize()

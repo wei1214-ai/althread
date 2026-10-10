@@ -30,7 +30,6 @@ data class BottomNavItem(
     @DrawableRes val iconRes: Int
 )
 
-// The 5 items for your bottom navigation bar
 val bottomNavItems = listOf(
     BottomNavItem(Screen.Home.route, "Home", R.drawable.home),
     BottomNavItem(Screen.Search.route, "Search", R.drawable.search),

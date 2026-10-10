@@ -59,16 +59,17 @@ import io.github.jan.supabase.auth.auth
 import io.github.jan.supabase.auth.providers.builtin.Email
 import kotlinx.coroutines.launch
 
-private fun String.isValidGmail(): Boolean {
+private fun String.isValidEmail(): Boolean {
     val t = trim()
-    if (t.isBlank() || t.length > 254) return false
+    if (t.isBlank() || t.length > 50) return false
     if (!Patterns.EMAIL_ADDRESS.matcher(t).matches()) return false
-    val lower = t.lowercase()
-    if (!lower.endsWith("@gmail.com")) return false
-    val local = lower.substringBefore("@")
-    if (local.length < 6 || local.length > 30) return false
+    val parts = t.split("@")
+    if (parts.size != 2) return false
+    val (local, domain) = parts
+    if (local.length < 1 || local.length > 64) return false
+    if (!domain.contains(".") || domain.length < 3 || domain.length > 253) return false
     if (local.startsWith(".") || local.endsWith(".") || local.contains("..")) return false
-    if (!local.matches(Regex("^[a-z0-9._]+$"))) return false
+    if (!local.matches(Regex("^[A-Za-z0-9._%+-]+$"))) return false
     return true
 }
 
@@ -109,7 +110,10 @@ private fun AuthInputField(
     var passwordVisible by remember { mutableStateOf(false) }
     OutlinedTextField(
         value = value,
-        onValueChange = onValueChange,
+        onValueChange = { v ->
+            // Enforce maxLength inside the field (call-site checks alone are bypassable via paste)
+            if (maxLength == null || v.length <= maxLength) onValueChange(v)
+        },
         placeholder = {Text(placeholder, fontSize = 14.sp)},
         singleLine = true,
         isError = errorMessage != null,
@@ -176,6 +180,8 @@ fun AuthScreen(
     var confirmPasswordError by remember { mutableStateOf<String?>(null) }
     var bannerMessage by remember { mutableStateOf<String?>(null) }
     var isBannerSuccess by remember { mutableStateOf(false) }
+    // Blocks double-tap parallel sign-in/sign-up storms.
+    var isAuthBusy by remember { mutableStateOf(false) }
 
     val scrollState = rememberScrollState()
     val scope = rememberCoroutineScope()
@@ -197,7 +203,7 @@ fun AuthScreen(
     fun validateLogin(): Boolean{
         emailError = when {
             email.isBlank() -> "Email is required"
-            !email.trim().isValidGmail() -> "Enter a valid Gmail address (e.g. name@gmail.com)."
+            !email.trim().isValidEmail() -> "Enter a valid email address."
             else -> null
         }
         if (emailError != null) {
@@ -215,7 +221,7 @@ fun AuthScreen(
     fun validateRegister(): Boolean{
         emailError = when{
             email.isBlank()->"Email is required."
-            !email.trim().isValidGmail()-> "Enter a valid Gmail address (e.g. name@gmail.com)."
+            !email.trim().isValidEmail()-> "Enter a valid email address."
             else -> null
         }
         if (emailError != null) {
@@ -337,9 +343,9 @@ fun AuthScreen(
                     AuthInputField(
                         placeholder = "Email Address",
                         value = email,
-                        onValueChange = { if (it.length <= 254) { email = it; emailError = null } },
+                        onValueChange = { if (it.length <= 50) { email = it; emailError = null } },
                         errorMessage = emailError,
-                        maxLength = 254
+                        maxLength = 50
                     )
                     Spacer(modifier = Modifier.height(8.dp))
 
@@ -372,21 +378,46 @@ fun AuthScreen(
                         }
                     }
 
-                    AuthPrimaryButton(text = "Log In",
+                    AuthPrimaryButton(text = if (isAuthBusy) "Logging in..." else "Log In",
                         onClick = {
+                            if (isAuthBusy) return@AuthPrimaryButton
                             if(validateLogin()) {
                                 val enteredEmail = email
                                 val enteredPassword = password
                                 scope.launch {
+                                    isAuthBusy = true
                                     try {
                                         supabase.auth.signInWith(Email){
                                             this.email= enteredEmail.trim()
                                             this.password= enteredPassword
                                         }
-                                        onLoginSuccess()
+                                        // Double lock (independent of the dashboard toggle):
+                                        // even if the server ever mints a session for an
+                                        // unverified address, the app refuses entry here.
+                                        val confirmed = supabase.auth.currentUserOrNull()
+                                            ?.emailConfirmedAt != null
+                                        if (!confirmed) {
+                                            runCatching { supabase.auth.signOut() }
+                                            bannerMessage = "Email not verified yet — check your inbox/spam for the confirmation link, then try again."
+                                            isBannerSuccess = false
+                                        } else {
+                                            onLoginSuccess()
+                                        }
                                     }catch (exception: Exception){
-                                        bannerMessage = exception.message?:"Incorrect email or password."
+                                        // Unverified accounts throw here — they can NOT get in,
+                                        // but the raw message ("Email not confirmed") confuses users.
+                                        val raw = exception.message.orEmpty()
+                                        bannerMessage = if (
+                                            raw.contains("confirm", ignoreCase = true) ||
+                                            raw.contains("verif", ignoreCase = true)
+                                        ) {
+                                            "Email not verified yet — check your inbox/spam for the confirmation link, then try again."
+                                        } else {
+                                            "Incorrect email or password."
+                                        }
                                         isBannerSuccess = false
+                                    } finally {
+                                        isAuthBusy = false
                                     }
                                 }
                             }
@@ -411,9 +442,9 @@ fun AuthScreen(
                 } else {
                     AuthInputField(placeholder = "Email address",
                         value = email,
-                        onValueChange = { if (it.length <= 254) { email = it; emailError = null } },
+                        onValueChange = { if (it.length <= 50) { email = it; emailError = null } },
                         errorMessage = emailError,
-                        maxLength = 254)
+                        maxLength = 50)
                     Spacer(modifier = Modifier.height(8.dp))
 
                     AuthInputField(placeholder = "Password",
@@ -452,26 +483,35 @@ fun AuthScreen(
                         }
                     }
 
-                    AuthPrimaryButton(text = "Create Account",
+                    AuthPrimaryButton(text = if (isAuthBusy) "Creating..." else "Create Account",
                         onClick = {
+                            if (isAuthBusy) return@AuthPrimaryButton
                             if (validateRegister()){
                                 val enteredEmail = email
                                 val enteredPassword = password
                                 scope.launch {
+                                    isAuthBusy = true
                                     try {
                                         supabase.auth.signUpWith(Email){
                                             this.email = enteredEmail.trim()
                                             this.password = enteredPassword
                                         }
+                                        // Product rule: signup NEVER auto-logs-in. Even if the
+                                        // server hands back a session (confirm-email OFF), drop
+                                        // it and force the user through the login screen.
+                                        // With confirm-email ON there is no session anyway.
+                                        runCatching { supabase.auth.signOut() }
                                         isLogin = true
-                                        password=""
-                                        confirmPassword= ""
+                                        password = ""
+                                        confirmPassword = ""
                                         clearFieldErrors()
-                                        bannerMessage = "Account created. Check your email to confirm it."
+                                        bannerMessage = "Account created. Check your email to confirm it, then log in."
                                         isBannerSuccess = true
                                     } catch (exception: Exception){
                                         bannerMessage= exception.message ?:"Could not create account."
                                         isBannerSuccess = false
+                                    } finally {
+                                        isAuthBusy = false
                                     }
                                 }
                             }

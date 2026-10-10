@@ -113,7 +113,8 @@ fun GarmentInputScreen(
     }
 
     fun launchCamera(side: GarmentSideId) {
-        if (state.isLoading) return
+        // Same per-side rule as ViewModel: only block the side that's busy.
+        if (state.loadingSide == side) return
         val perm = Manifest.permission.CAMERA
         val granted = ContextCompat.checkSelfPermission(context, perm) == PackageManager.PERMISSION_GRANTED
         if (granted) {
@@ -129,7 +130,8 @@ fun GarmentInputScreen(
     }
 
     val ready = state.frontCutoutPath != null && state.backCutoutPath != null && !state.isLoading
-    val enabled = !state.isLoading
+    // Per-side enable: one side inferring must not lock the other picker.
+    fun sideEnabled(side: GarmentSideId) = state.loadingSide != side
     val isDarkTheme = MaterialTheme.colorScheme.background.luminance() < 0.5f
     val screenBackground = if (isDarkTheme) MaterialTheme.colorScheme.background else Color(0xFFFAFAFA)
 
@@ -155,7 +157,7 @@ fun GarmentInputScreen(
             PickerBox(
                 label = "FRONT",
                 cutoutPath = state.frontCutoutPath,
-                enabled = enabled,
+                enabled = sideEnabled(GarmentSideId.FRONT),
                 modifier = Modifier.weight(1f),
                 onAlbumClick = { pickFrontAlbum.launch("image/*") },
                 onCameraClick = { launchCamera(GarmentSideId.FRONT) }
@@ -163,7 +165,7 @@ fun GarmentInputScreen(
             PickerBox(
                 label = "BACK",
                 cutoutPath = state.backCutoutPath,
-                enabled = enabled,
+                enabled = sideEnabled(GarmentSideId.BACK),
                 modifier = Modifier.weight(1f),
                 onAlbumClick = { pickBackAlbum.launch("image/*") },
                 onCameraClick = { launchCamera(GarmentSideId.BACK) }
@@ -223,7 +225,12 @@ fun GarmentInputScreen(
                 enabled = ready,
                 modifier = Modifier.weight(1f).height(52.dp),
                 shape = RoundedCornerShape(14.dp),
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1B1B1B), contentColor = Color.White),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = com.example.myapplicationkoG.ui.theme.Cyan,
+                    contentColor = MidnightBlue,
+                    disabledContainerColor = MaterialTheme.colorScheme.surfaceVariant,
+                    disabledContentColor = MaterialTheme.colorScheme.onSurfaceVariant
+                ),
             ) { Text("Open Editor", fontWeight = FontWeight.SemiBold) }
         }
     }

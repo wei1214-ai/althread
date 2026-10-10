@@ -50,17 +50,20 @@ import coil.compose.AsyncImage
 import com.example.myapplicationkoG.ui.theme.Cyan
 import com.example.myapplicationkoG.ui.theme.MidnightBlue
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import androidx.compose.ui.platform.LocalContext
 import coil.ImageLoader
 import coil.decode.VideoFrameDecoder
 import coil.request.ImageRequest
 import coil.request.videoFrameMillis
 
+/**
+ * Search screen: debounced keyword search over posts with a sort menu and a grid of results.
+ */
 @Composable
 fun SearchScreen() {
 
     var keyword by remember { mutableStateOf("") }
-    // "latest" or "highest_likes"
     var selectedSortBy by remember { mutableStateOf("latest") }
     var isFilterMenuExpanded by remember { mutableStateOf(false) }
 
@@ -69,9 +72,10 @@ fun SearchScreen() {
     var selectedPostForDetail by remember { mutableStateOf<Post?>(null) }
 
     val context = LocalContext.current
+    val appContext = remember(context) { context.applicationContext }
 
-    val thumbnailImageLoader = remember {
-        ImageLoader.Builder(context)
+    val thumbnailImageLoader = remember(appContext) {
+        ImageLoader.Builder(appContext)
             .components {
                 add(VideoFrameDecoder.Factory())
             }
@@ -80,36 +84,33 @@ fun SearchScreen() {
 
     val repository = remember { PostRepository() }
 
-    // Observe keyword and sort changes
+    // Observe keyword and sort changes: debounce first, then query; drop stale results.
     LaunchedEffect(keyword, selectedSortBy) {
-        isLoading = true
-
-        // When input is empty, load all posts with current sort
-        if (keyword.isBlank()) {
-            try {
-                results = repository.getPosts(category = "All", sortBy = selectedSortBy)
-            } catch (e: Exception) {
-                results = emptyList()
-            } finally {
-                isLoading = false
-            }
-            return@LaunchedEffect
-        }
-
-        // Debounce
+        val currentKeyword = keyword
+        val currentSort = selectedSortBy
+        // Debounce before showing loading to avoid flicker on fast typing
         delay(400)
-
+        // If keyword/sort changed during debounce, this effect is cancelled and relaunched;
+        // cooperative check so a cancelled effect does not touch state.
+        if (!coroutineContext.isActive) return@LaunchedEffect
+        if (currentKeyword != keyword || currentSort != selectedSortBy) return@LaunchedEffect
+        isLoading = true
         try {
-            // Pass current sort rule into search
-            results = repository.searchPosts(query = keyword.trim(), sortBy = selectedSortBy)
+            results = if (currentKeyword.isBlank()) {
+                repository.getPosts(category = "All", sortBy = currentSort)
+            } else {
+                repository.searchPosts(query = currentKeyword.trim(), sortBy = currentSort)
+            }
+            // Drop stale response if user typed meanwhile
+            if (!coroutineContext.isActive) return@LaunchedEffect
+            if (currentKeyword != keyword || currentSort != selectedSortBy) return@LaunchedEffect
         } catch (e: Exception) {
-            results = emptyList()
+            if (currentKeyword == keyword && currentSort == selectedSortBy) results = emptyList()
         } finally {
-            isLoading = false
+            if (currentKeyword == keyword && currentSort == selectedSortBy) isLoading = false
         }
     }
 
-    // Show PostCard dialog on image click
     selectedPostForDetail?.let { post ->
         Dialog(onDismissRequest = { selectedPostForDetail = null }) {
             Box(
@@ -128,7 +129,6 @@ fun SearchScreen() {
             .background(MaterialTheme.colorScheme.background)
     ) {
 
-        // Search bar and Filter button
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -138,7 +138,7 @@ fun SearchScreen() {
 
             OutlinedTextField(
                 value = keyword,
-                onValueChange = { keyword = it },
+                onValueChange = { if (it.length <= 30) keyword = it },
                 modifier = Modifier.weight(1f),
                 singleLine = true,
                 placeholder = { Text(text = "Search clothes, tags...") },
@@ -165,7 +165,6 @@ fun SearchScreen() {
 
             Spacer(modifier = Modifier.width(12.dp))
 
-            // Filter button with DropdownMenu
             Box {
                 Box(
                     modifier = Modifier
@@ -183,7 +182,6 @@ fun SearchScreen() {
                     )
                 }
 
-                // Sort options menu
                 DropdownMenu(
                     expanded = isFilterMenuExpanded,
                     onDismissRequest = { isFilterMenuExpanded = false },
@@ -218,7 +216,6 @@ fun SearchScreen() {
             }
         }
 
-        // Content area
         if (isLoading) {
             Box(
                 modifier = Modifier.fillMaxSize(),
@@ -253,8 +250,9 @@ fun SearchScreen() {
                     val coverUrl = post.mediaUrls.firstOrNull() ?: post.mediaUrl
 
                     AsyncImage(
-                        model = ImageRequest.Builder(context)
+                        model = ImageRequest.Builder(appContext)
                             .data(coverUrl)
+                            .size(600)
                             .videoFrameMillis(1_000)
                             .crossfade(true)
                             .build(),

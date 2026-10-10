@@ -5,6 +5,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.rememberTransformableState
+import androidx.compose.foundation.gestures.transformable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -82,11 +84,23 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.graphics.luminance
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import com.example.myapplicationkoG.textColorForTheme
 
+/**
+ * Design-space editor.
+ *
+ * Ownership:
+ * - [dyeMap]/[buttonMap] below are the source of truth for the current design;
+ *   every committed edit writes them immediately.
+ * - [GarmentInputViewModel.draftDye]/[draftButtons]/[draftSide] mirror the maps so
+ *   rotation re-seeds the UI. Undo/redo stacks are session-local (not restored).
+ * - VTON execution lives in the ViewModel; this screen only builds the composite
+ *   garment file and observes the run via [VtonDialog].
+ */
 data class DyeState(val color: Color, val strength: Float)
 data class PlacedButton(val pos: Offset, val scale: Float, val color: Color, val style: Int = 0, val rotation: Float = 0f)
 data class EditorSnapshot(
@@ -101,13 +115,13 @@ fun EditorPlaceHolder(
     onBack: () -> Unit,
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
-    var currentSide by remember { mutableStateOf(GarmentSideId.FRONT) }
+    // Seeded from the ViewModel draft so rotation restores side and edits.
+    var currentSide by remember { mutableStateOf(viewModel.draftSide) }
     val currentPath = when (currentSide) {
         GarmentSideId.FRONT -> state.frontCutoutPath
         GarmentSideId.BACK -> state.backCutoutPath
     }
 
-    // Zoom state for garment
     var scale by remember { mutableFloatStateOf(1.4f) }
     var offset by remember { mutableStateOf(Offset.Zero) }
     val context = LocalContext.current
@@ -132,12 +146,14 @@ fun EditorPlaceHolder(
     var dyeStrength by remember { mutableFloatStateOf(0.55f) }
     var dyeMap by remember { mutableStateOf(mapOf<GarmentSideId, DyeState>()) }
     var dyedImage by remember { mutableStateOf<ImageBitmap?>(null) }
-    // Patch buttons, per side
+    var dyedBacking by remember { mutableStateOf<android.graphics.Bitmap?>(null) }
+    // Last rendered (path, color, strength); equal values skip re-render.
+    var lastPreviewKey by remember { mutableStateOf<Triple<String, Int, Float>?>(null) }
     var buttonMap by remember { mutableStateOf(mapOf<GarmentSideId, List<PlacedButton>>()) }
     var overlaySize by remember { mutableStateOf(IntSize.Zero) }
     var buttonImgs by remember { mutableStateOf(mapOf<Int, ImageBitmap>()) }
     var buttonContent by remember { mutableStateOf(mapOf<Int, Pair<Float, Float>>()) }
-    // Undo/redo stacks, each entry is one committed step
+    // One committed edit per history entry.
     var undoStack by remember { mutableStateOf(listOf<EditorSnapshot>()) }
     var redoStack by remember { mutableStateOf(listOf<EditorSnapshot>()) }
     var prevTool by remember { mutableStateOf<Int?>(null) }
@@ -153,6 +169,8 @@ fun EditorPlaceHolder(
     )
 
     var dyeActive by remember { mutableStateOf(false) }
+    // True while a strength-slider drag is in flight (undo pushed once at drag start).
+    var dyeSliderActive by remember { mutableStateOf(false) }
     var buttonScale by remember { mutableFloatStateOf(1f) }
     var buttonStyle by remember { mutableIntStateOf(0) }
     var buttonRotation by remember { mutableFloatStateOf(0f) }
@@ -166,13 +184,27 @@ fun EditorPlaceHolder(
         rotDragStart = null
     }
 
-    // Load saved design if opened from Continue screen
+    // Apply a staged Continue-screen design once, else re-seed from the rotation draft.
     LaunchedEffect(Unit) {
-        DesignSession.consume()?.let { loaded ->
-            dyeMap = loaded.dye
-            buttonMap = loaded.buttons
-            loaded.dye[GarmentSideId.FRONT]?.let { dyeActive = true; dyeColor = it.color; dyeStrength = it.strength }
+        val staged = viewModel.consumeStagedDesign()
+        if (staged != null) {
+            dyeMap = staged.dye
+            buttonMap = staged.buttons
+            currentSide = viewModel.draftSide
+            staged.dye[currentSide]?.let { dyeActive = true; dyeColor = it.color; dyeStrength = it.strength }
+        } else {
+            viewModel.draftDye?.let { dyeMap = it }
+            viewModel.draftButtons?.let { buttonMap = it }
+            currentSide = viewModel.draftSide
+            dyeMap[currentSide]?.let { dyeActive = true; dyeColor = it.color; dyeStrength = it.strength }
         }
+    }
+
+    // Mirror committed edits into the ViewModel draft for rotation recovery.
+    LaunchedEffect(dyeMap, buttonMap, currentSide) {
+        viewModel.draftDye = dyeMap
+        viewModel.draftButtons = buttonMap
+        viewModel.draftSide = currentSide
     }
 
     fun currentSnapshot() = EditorSnapshot(dyeMap, buttonMap)
@@ -189,6 +221,7 @@ fun EditorPlaceHolder(
         undoStack = undoStack + currentSnapshot()
         redoStack = emptyList()
     }
+
     fun undo() {
         if (undoStack.isEmpty()) return
         redoStack = redoStack + currentSnapshot()
@@ -226,14 +259,19 @@ fun EditorPlaceHolder(
     }
 
     suspend fun buildCompositeGarment(): java.io.File? = withContext(Dispatchers.Default) {
-        val path = state.frontCutoutPath ?: return@withContext null
-        val dye = dyeMap[GarmentSideId.FRONT]
+        // Render the side currently in view (fall back to FRONT when it has no image).
+        val side = if (
+            (if (currentSide == GarmentSideId.FRONT) state.frontCutoutPath else state.backCutoutPath) != null
+        ) currentSide else GarmentSideId.FRONT
+        val path = (if (side == GarmentSideId.FRONT) state.frontCutoutPath else state.backCutoutPath)
+            ?: return@withContext null
+        val dye = dyeMap[side]
         var bmp = runCatching {
             if (dye != null) makeDyedBitmap(path, dye.color, dye.strength)
             else android.graphics.BitmapFactory.decodeFile(path)
         }.getOrNull() ?: return@withContext null
         bmp = bmp.copy(android.graphics.Bitmap.Config.ARGB_8888, true)
-        val list = buttonMap[GarmentSideId.FRONT].orEmpty()
+        val list = buttonMap[side].orEmpty()
         if (list.isNotEmpty()) {
             val canvas = android.graphics.Canvas(bmp)
             val paint = android.graphics.Paint(
@@ -271,21 +309,16 @@ fun EditorPlaceHolder(
         selectedButtonIdx = -1
         sizeDragStart = null
         rotDragStart = null
-        ChallengeSession.title = null
-        ChallengeSession.description = null
+        // Clear the challenge fields together so a stale post id cannot leak
+        // into the next saved design.
+        viewModel.clearChallenge()
         Toast.makeText(context, "Design cleared", Toast.LENGTH_SHORT).show()
     }
 
-    // Leaving dye mode commits one step; entering restores committed values
+    // Snapshot pre-dye state once when the dye tool opens.
     LaunchedEffect(selectedTool) {
-        if (prevTool == 0 && selectedTool != 0) {
-            val live = if (dyeActive) DyeState(dyeColor, dyeStrength) else null
-            if (live != dyeMap[currentSide]) {
-                pushHistory()
-                dyeMap = if (live != null) dyeMap + (currentSide to live) else dyeMap - currentSide
-            }
-        }
         if (selectedTool == 0 && prevTool != 0) {
+            pushHistory()
             val d = dyeMap[currentSide]
             dyeActive = d != null
             d?.let { dyeColor = it.color; dyeStrength = it.strength }
@@ -293,7 +326,7 @@ fun EditorPlaceHolder(
         prevTool = selectedTool
     }
 
-    // Dye preview while editing, committed dye otherwise
+    // Dye preview while editing, committed dye otherwise.
     val activeDye: DyeState? = if (selectedTool == 0) {
         if (dyeActive) DyeState(dyeColor, dyeStrength) else null
     } else dyeMap[currentSide]
@@ -301,16 +334,39 @@ fun EditorPlaceHolder(
         val path = currentPath
         val dye = activeDye
         if (path == null || dye == null) {
+            runCatching { dyedBacking?.takeIf { !it.isRecycled }?.recycle() }
+            dyedBacking = null
             dyedImage = null
+            lastPreviewKey = null
             return@LaunchedEffect
         }
-        val result = withContext(Dispatchers.Default) {
-            runCatching { makeDyedBitmap(path, dye.color, dye.strength) }.getOrNull()
+        // Skip re-render when the inputs are value-identical.
+        val key = Triple(path, dye.color.toArgb(), dye.strength)
+        if (key == lastPreviewKey && dyedImage != null) return@LaunchedEffect
+        // Debounce: render once the slider settles instead of once per tick.
+        kotlinx.coroutines.delay(180)
+        // Render at display size; the preview cannot show more pixels than the canvas.
+        val edge = maxOf(overlaySize.width, overlaySize.height, 1).coerceIn(720, 1600)
+        val bmp = withContext(Dispatchers.Default) {
+            runCatching { makeDyedBitmap(path, dye.color, dye.strength, edge) }.getOrNull()
         }
-        dyedImage = result?.asImageBitmap()
+        if (!coroutineContext.isActive) {
+            runCatching { bmp?.takeIf { !it.isRecycled }?.recycle() }
+            return@LaunchedEffect
+        }
+        runCatching { dyedBacking?.takeIf { !it.isRecycled }?.recycle() }
+        dyedBacking = bmp
+        dyedImage = bmp?.asImageBitmap()
+        if (bmp != null) lastPreviewKey = key
     }
 
-    // Textures: buttons 0-2 (round, circular mask), patches 3-6 (keep shape, gentle key)
+    // Warm the downsampled hit-test bitmap off the main thread so taps never decode on it.
+    LaunchedEffect(currentPath) {
+        val path = currentPath ?: return@LaunchedEffect
+        withContext(Dispatchers.Default) { runCatching { hitBitmap(path) } }
+    }
+
+    // Button/patch textures: styles 0-2 are circularly masked, 3-6 keep shape.
     LaunchedEffect(Unit) {
         val (imgs, boxes) = withContext(Dispatchers.Default) {
             val mImg = mutableMapOf<Int, ImageBitmap>()
@@ -369,9 +425,9 @@ fun EditorPlaceHolder(
             }
             Spacer(modifier = Modifier.height(8.dp))
             var showBriefDialog by remember { mutableStateOf(false) }
-            val challengeBrief = remember { ChallengeSession.peekPair() }
-            val challengeTitle = challengeBrief.first
-            val challengeDesc = challengeBrief.second
+            // Observe ViewModel flows so rotation and updates stay in sync.
+            val challengeTitle by viewModel.challengeTitleFlow.collectAsStateWithLifecycle()
+            val challengeDesc by viewModel.challengeDescriptionFlow.collectAsStateWithLifecycle()
             if (!challengeTitle.isNullOrBlank() || !challengeDesc.isNullOrBlank()) {
                 Row(
                     modifier = Modifier
@@ -416,14 +472,17 @@ fun EditorPlaceHolder(
                         },
                         text = {
                             Column {
-                                if (!challengeTitle.isNullOrBlank()) {
-                                    Text(challengeTitle, fontWeight = FontWeight.Bold, fontSize = 15.sp, color = textColorForTheme(Color.Black))
+                                // Copy delegates to locals: smart cast doesn't work on `by` properties.
+                                val title = challengeTitle
+                                val desc = challengeDesc
+                                if (!title.isNullOrBlank()) {
+                                    Text(title, fontWeight = FontWeight.Bold, fontSize = 15.sp, color = textColorForTheme(Color.Black))
                                 }
-                                if (!challengeDesc.isNullOrBlank()) {
+                                if (!desc.isNullOrBlank()) {
                                     Spacer(modifier = Modifier.height(8.dp))
-                                    Text(challengeDesc, fontSize = 14.sp, lineHeight = 20.sp, color = textColorForTheme(Color.Gray))
+                                    Text(desc, fontSize = 14.sp, lineHeight = 20.sp, color = textColorForTheme(Color.Gray))
                                 }
-                                if (challengeTitle.isNullOrBlank() && challengeDesc.isNullOrBlank()) {
+                                if (title.isNullOrBlank() && desc.isNullOrBlank()) {
                                     Text("No details", fontSize = 13.sp, color = textColorForTheme(Color.Gray))
                                 }
                             }
@@ -536,8 +595,12 @@ fun EditorPlaceHolder(
                                             Toast.makeText(context, "No garment to try on", Toast.LENGTH_SHORT).show()
                                             return@clickable
                                         }
-                                        vtonPreparing = true
-                                        scope.launch {
+                                            vtonPreparing = true
+                                            scope.launch {
+                                                // Delete the previous composite first; one temp file per
+                                                // try-on would otherwise fill the cache directory.
+                                                runCatching { vtonFile?.delete() }
+                                            vtonFile = null
                                             vtonFile = runCatching { buildCompositeGarment() }.getOrNull()
                                             vtonPreparing = false
                                             if (vtonFile != null) showVton = true
@@ -587,7 +650,29 @@ fun EditorPlaceHolder(
                             .fillMaxSize()
                             .clip(RoundedCornerShape(20.dp))
                             .background(if (isDarkDesign) Color(0xFF121212) else Color.White)
-                            .border(1.dp, if (isDarkDesign) Color(0xFF333333) else Color(0xFFE0E0E0), RoundedCornerShape(20.dp)),
+                            .border(1.dp, if (isDarkDesign) Color(0xFF333333) else Color(0xFFE0E0E0), RoundedCornerShape(20.dp))
+                            .transformable(
+                                rememberTransformableState { zoomChange, panChange, _ ->
+                                    scale = (scale * zoomChange).coerceIn(1f, 5f)
+                                    val ow = overlaySize.width.toFloat()
+                                    val oh = overlaySize.height.toFloat()
+                                    val maxX = maxOf(0f, (ow * scale - ow) / 2f)
+                                    val maxY = maxOf(0f, (oh * scale - oh) / 2f)
+                                    offset = Offset(
+                                        (offset.x + panChange.x).coerceIn(-maxX, maxX),
+                                        (offset.y + panChange.y).coerceIn(-maxY, maxY)
+                                    )
+                                }
+                            )
+                            // Double-tap resets the view.
+                            .pointerInput(Unit) {
+                                detectTapGestures(
+                                    onDoubleTap = {
+                                        scale = 1f
+                                        offset = Offset.Zero
+                                    }
+                                )
+                            },
                         contentAlignment = Alignment.Center
                     ) {
                         if (currentPath != null) {
@@ -622,6 +707,14 @@ fun EditorPlaceHolder(
                                     modifier = Modifier
                                         .fillMaxSize()
                                         .onSizeChanged { overlaySize = it }
+                                        // Inverse of the parent zoom layer, so patches track the
+                                        // garment position while keeping constant screen size.
+                                        .graphicsLayer(
+                                            scaleX = 1f / scale,
+                                            scaleY = 1f / scale,
+                                            translationX = -offset.x / scale,
+                                            translationY = -offset.y / scale
+                                        )
                                 ) {
                                     val bwPx = overlaySize.width.toFloat().coerceAtLeast(1f)
                                     val bhPx = overlaySize.height.toFloat().coerceAtLeast(1f)
@@ -699,10 +792,11 @@ fun EditorPlaceHolder(
                                                         onTap = { pos ->
                                                             val fx = (pos.x / bwPx).coerceIn(0f, 1f)
                                                             val fy = (pos.y / bhPx).coerceIn(0f, 1f)
-                                                            // 1) tap on an existing button selects it (inner disc only)
+                                                            // Tap on an existing patch selects it; otherwise place a new one on the garment.
                                                             val hitIdx = curButtons.indexOfFirst { btn ->
                                                                 if ((buttonImgs[btn.style] ?: buttonImgs[0]) == null) return@indexOfFirst false
-                                                                val bBase = 0.05f * minOf(bwPx, bhPx) * scale
+                                                                // Screen-constant size: zoom moves patches without resizing them.
+                                                                val bBase = 0.05f * minOf(bwPx, bhPx)
                                                                 val bTarget = (bBase * btn.scale).coerceIn(bBase * minScaleFor(btn.style), bBase * maxScaleFor(btn.style))
                                                                 val c = garmentToOverlay(btn.pos.x, btn.pos.y)
                                                                 val dx = pos.x - c.x
@@ -724,7 +818,7 @@ fun EditorPlaceHolder(
                                                                 rotDragStart = null
                                                                 return@detectTapGestures
                                                             }
-                                                            // 2) otherwise place a new one (garment only, no white space)
+                                                            // Place a new patch; reject taps on empty background.
                                                             if (!toGarmentPixel(fx, fy)) {
                                                                 Toast.makeText(context, "Please place buttons on the garment", Toast.LENGTH_SHORT).show()
                                                                 return@detectTapGestures
@@ -745,7 +839,7 @@ fun EditorPlaceHolder(
                                     ) {
                                         val imgs = buttonImgs
                                         if (imgs.isNotEmpty()) {
-                                            val base = 0.05f * minOf(size.width, size.height) * scale
+                                            val base = 0.05f * minOf(size.width, size.height)
                                             curButtons.forEachIndexed { i, btn ->
                                                 val b = imgs[btn.style] ?: imgs[0] ?: return@forEachIndexed
                                                 val (cw, ch) = buttonContent[btn.style] ?: buttonContent[0] ?: (b.width.toFloat() to b.height.toFloat())
@@ -792,7 +886,10 @@ fun EditorPlaceHolder(
                                 .clickable {
                                     scale = 1.4f; offset = Offset.Zero
                                     currentSide = GarmentSideId.BACK
-                                    dyeMap[GarmentSideId.BACK]?.let { dyeColor = it.color; dyeStrength = it.strength }
+                                    // Full sync: a side without dye must clear the stale color.
+                                    val b = dyeMap[GarmentSideId.BACK]
+                                    dyeActive = b != null
+                                    if (b != null) { dyeColor = b.color; dyeStrength = b.strength }
                                 }
                                 .padding(horizontal = 8.dp, vertical = 6.dp),
                             contentAlignment = Alignment.Center
@@ -832,8 +929,12 @@ fun EditorPlaceHolder(
                                 .background(Cyan)
                                 .clickable {
                                     scale = 1.4f; offset = Offset.Zero
+                                    // No commit needed (immediate-write model): just switch + sync.
                                     currentSide = GarmentSideId.FRONT
-                                    dyeMap[GarmentSideId.FRONT]?.let { dyeColor = it.color; dyeStrength = it.strength }
+                                    // Full sync (not ?.let): see above.
+                                    val f = dyeMap[GarmentSideId.FRONT]
+                                    dyeActive = f != null
+                                    if (f != null) { dyeColor = f.color; dyeStrength = f.strength }
                                 }
                                 .padding(horizontal = 8.dp, vertical = 6.dp),
                             contentAlignment = Alignment.Center
@@ -894,11 +995,19 @@ fun EditorPlaceHolder(
                                             CircleShape
                                         )
                                         .clickable {
+                                            // Immediate-write model: the map IS the truth, no
+                                            // commit step exists, so nothing can be "lost" on
+                                            // tab switch / save / rotation draft.
+                                            // One dye action colors BOTH sides at once.
+                                            pushHistory()
                                             if (dyeActive && dyeColor == c) {
                                                 dyeActive = false
+                                                dyeMap = dyeMap - listOf(GarmentSideId.FRONT, GarmentSideId.BACK)
                                             } else {
                                                 dyeColor = c
                                                 dyeActive = true
+                                                val s = DyeState(c, dyeStrength)
+                                                dyeMap = dyeMap + (GarmentSideId.FRONT to s) + (GarmentSideId.BACK to s)
                                             }
                                         }
                                 )
@@ -908,7 +1017,19 @@ fun EditorPlaceHolder(
                         Text("Strength", color = Color.Gray, fontSize = 11.sp)
                         Slider(
                             value = dyeStrength,
-                            onValueChange = { dyeStrength = it },
+                            onValueChange = {
+                                // One undo step per drag (not per tick), both sides written live.
+                                if (!dyeSliderActive) {
+                                    dyeSliderActive = true
+                                    pushHistory()
+                                }
+                                dyeStrength = it
+                                if (dyeActive) {
+                                    val s = DyeState(dyeColor, it)
+                                    dyeMap = dyeMap + (GarmentSideId.FRONT to s) + (GarmentSideId.BACK to s)
+                                }
+                            },
+                            onValueChangeFinished = { dyeSliderActive = false },
                             valueRange = 0.2f..0.85f,
                             modifier = Modifier.height(24.dp)
                         )
@@ -1106,9 +1227,11 @@ fun EditorPlaceHolder(
                     Spacer(modifier = Modifier.height(8.dp))
                     OutlinedTextField(
                         value = saveName,
-                        onValueChange = { saveName = it },
+                        // 30 = IG username standard; grid tiles show a single line.
+                        onValueChange = { if (it.length <= 30) saveName = it },
                         singleLine = true,
                         placeholder = { Text("My design", color = textColorForTheme(Color.Gray)) },
+                        supportingText = { Text("${saveName.length}/30", fontSize = 11.sp) },
                         modifier = Modifier.fillMaxWidth()
                     )
                 }
@@ -1118,6 +1241,7 @@ fun EditorPlaceHolder(
                     onClick = {
                         isSaving = true
                         scope.launch {
+                            // No flush needed (immediate-write model): dyeMap is always current.
                             try {
                                 val repo = DesignRepository()
                                 val frontPath = state.frontCutoutPath
@@ -1186,13 +1310,22 @@ fun EditorPlaceHolder(
 
     AiChatDrawer(
         visible = showAiChat,
-        onDismiss = { showAiChat = false }
+        onDismiss = { showAiChat = false },
+        // Thread sees the current design-space garment when the user asks.
+        designFrontPath = state.frontCutoutPath,
+        designBackPath = state.backCutoutPath
     )
 
     if (showVton) {
         VtonDialog(
             garmentFile = vtonFile,
-            onDismiss = { showVton = false }
+            // Real dismiss clears the VM-owned run + temps (rotation recreates
+            // the dialog WITHOUT dismissing, so the run survives it).
+            onDismiss = {
+                viewModel.clearVton()
+                showVton = false
+            },
+            viewModel = viewModel
         )
     }
 }
@@ -1292,9 +1425,21 @@ private fun keyOutBlack(src: android.graphics.Bitmap, lo: Float = 25f, hi: Float
 private fun makeDyedBitmap(
     path: String,
     dye: Color,
-    strength: Float
+    strength: Float,
+    maxEdge: Int = 0
 ): android.graphics.Bitmap {
-    val src = BitmapFactory.decodeFile(path) ?: error("Cannot decode $path")
+    val src = if (maxEdge > 0) {
+        // Downsampled decode for previews: full 12MP IntArray per slider tick OOMs.
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(path, bounds)
+        var sample = 1
+        while (bounds.outWidth / sample > maxEdge || bounds.outHeight / sample > maxEdge) sample *= 2
+        (if (sample > 1) {
+            BitmapFactory.decodeFile(path, BitmapFactory.Options().apply { inSampleSize = sample })
+        } else null) ?: BitmapFactory.decodeFile(path) ?: error("Cannot decode $path")
+    } else {
+        BitmapFactory.decodeFile(path) ?: error("Cannot decode $path")
+    }
     val w = src.width
     val h = src.height
     val out = src.copy(android.graphics.Bitmap.Config.ARGB_8888, true)

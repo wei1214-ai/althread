@@ -16,9 +16,13 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -90,18 +94,9 @@ import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 
 private fun extractAvatarUrl(post: Post): String {
-    return try {
-        val field = post::class.java.declaredFields.firstOrNull {
-            it.name.contains("avatar", ignoreCase = true) ||
-                    it.name.contains("profile", ignoreCase = true) ||
-                    it.name.contains("userpic", ignoreCase = true) ||
-                    it.name.contains("image", ignoreCase = true)
-        }
-        field?.isAccessible = true
-        (field?.get(post) as? String) ?: ""
-    } catch (e: Exception) {
-        ""
-    }
+    // Direct field access — Post.userProfilePicUrl is the source of truth.
+    // (Old reflection version always missed and returned placeholder.)
+    return post.userProfilePicUrl.orEmpty()
 }
 
 private fun formatPostTime(createdAt: String): String {
@@ -166,7 +161,7 @@ private fun ChallengeSourceCard(
         }
         Column(modifier = Modifier.weight(1f)) {
             Text(
-                text = if (source != null) "�?In↳ In response to @${source.username}'s Challenge" else "�?In↳ In response to a Challenge",
+                text = if (source != null) "In response to @${source.username}'s challenge" else "In response to a challenge",
                 fontSize = 12.sp,
                 fontWeight = FontWeight.SemiBold,
                 color = textColorForTheme(MidnightBlue),
@@ -209,7 +204,7 @@ fun PostCard(
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
 
-    val avatarUrl = remember(post) { extractAvatarUrl(post) }
+    val avatarUrl = remember(post.id, post.userProfilePicUrl) { extractAvatarUrl(post) }
 
     var currentUserId by remember { mutableStateOf<String?>(null) }
     var isMenuExpanded by remember { mutableStateOf(false) }
@@ -225,7 +220,7 @@ fun PostCard(
         }
     }
 
-    val imagesList = remember(post) {
+    val imagesList = remember(post.id, post.mediaUrl, post.mediaUrls) {
         if (post.mediaUrls.isNotEmpty()) {
             post.mediaUrls
         } else if (post.mediaUrl.isNotBlank()) {
@@ -235,22 +230,31 @@ fun PostCard(
         }
     }
 
-    val pagerState = rememberPagerState(pageCount = { imagesList.size })
+    // pageCount=0 crashes foundation 1.6+; coerce to >=1 and guard UI below.
+    val pagerState = rememberPagerState(pageCount = { imagesList.size.coerceAtLeast(1) })
 
     var showFullScreenViewer by remember { mutableStateOf(false) }
     var fullScreenInitialPage by remember { mutableIntStateOf(0) }
+    // Adaptive media box: photo aspect (w/h) learned from the first image.
+    // Defaults to 4:3 and clamps the ratio so extreme aspect ratios cannot
+    // distort the feed layout.
+    var mediaRatio by remember(post.id) { mutableFloatStateOf(4f / 3f) }
 
     // LazyColumn disposes cards that leave the viewport.  Keep interaction state
     // saveable and scoped to the post ID so it is restored when this card is
     // composed again after scrolling back to it.
     var isLiked by rememberSaveable(post.id) { mutableStateOf(post.isLikedByCurrentUser) }
     var likeCount by rememberSaveable(post.id) { mutableIntStateOf(post.likeCount) }
-    var isSaved by remember { mutableStateOf(post.isFavoritedByCurrentUser) }
+    var isSaved by rememberSaveable(post.id) { mutableStateOf(post.isFavoritedByCurrentUser) }
+    // Same double-tap guard as the like toggle: one request at a time.
+    var isSaveBusy by rememberSaveable(post.id) { mutableStateOf(false) }
+    // Blocks double-tap race: second tap while request in flight corrupts count.
+    var isLikeBusy by rememberSaveable(post.id) { mutableStateOf(false) }
 
     val doubleTapHeartScale = remember { Animatable(0f) }
 
-    var challengeSource by remember { mutableStateOf<Post?>(null) }
-    LaunchedEffect(post.challengePostId) {
+    var challengeSource by remember(post.id) { mutableStateOf<Post?>(null) }
+    LaunchedEffect(post.id, post.challengePostId) {
         val sourceId = post.challengePostId
         challengeSource = if (sourceId.isNullOrBlank()) null else repository.getPostById(sourceId)
     }
@@ -261,8 +265,24 @@ fun PostCard(
     var newCommentText by remember { mutableStateOf("") }
     var isSendingComment by remember { mutableStateOf(false) }
     var commentError by remember { mutableStateOf<String?>(null) }
+    // Synced from DB (comment_count column) + refreshed whenever the dialog loads.
+    var commentCount by rememberSaveable(post.id) { mutableIntStateOf(post.commentCount) }
+
+    fun openComments() {
+        showCommentsDialog = true
+        scope.launch {
+            isLoadingComments = true
+            commentsList = repository.getComments(post.id)
+            commentCount = commentsList.size
+            isLoadingComments = false
+        }
+    }
 
     fun handleLikeToggle() {
+        // Set synchronously — the old version set it INSIDE launch, so two
+        // rapid taps both slipped past the guard and wrote twice (+2/-2).
+        if (isLikeBusy) return
+        isLikeBusy = true
         val previousIsLiked = isLiked
         val previousLikeCount = likeCount
         val targetIsLiked = !isLiked
@@ -271,15 +291,25 @@ fun PostCard(
         onLikeStateChanged?.invoke(post.id, isLiked, likeCount)
 
         scope.launch {
-            val serverCount = repository.toggleLike(post.id)
-            if (serverCount != -1) {
-                likeCount = serverCount
-                onLikeStateChanged?.invoke(post.id, isLiked, likeCount)
-            } else {
-                // Do not leave the feed showing a change that was not saved.
-                isLiked = previousIsLiked
-                likeCount = previousLikeCount
-                onLikeStateChanged?.invoke(post.id, isLiked, likeCount)
+            try {
+                val serverCount = repository.toggleLike(post.id)
+                if (serverCount != -1) {
+                    // Trigger may be missing/slow on backend: never show a stale
+                    // count that undoes our confirmed like/unlike.
+                    likeCount = if (targetIsLiked) {
+                        maxOf(serverCount, previousLikeCount + 1)
+                    } else {
+                        minOf(serverCount, (previousLikeCount - 1).coerceAtLeast(0))
+                    }
+                    onLikeStateChanged?.invoke(post.id, isLiked, likeCount)
+                } else {
+                    // Do not leave the feed showing a change that was not saved.
+                    isLiked = previousIsLiked
+                    likeCount = previousLikeCount
+                    onLikeStateChanged?.invoke(post.id, isLiked, likeCount)
+                }
+            } finally {
+                isLikeBusy = false
             }
         }
     }
@@ -294,7 +324,6 @@ fun PostCard(
     ) {
         Column(modifier = Modifier.padding(12.dp)) {
 
-            // Header Section
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier.fillMaxWidth()
@@ -337,7 +366,6 @@ fun PostCard(
                     }
                 }
 
-                // Enlarged Category / Trend Box
                 if (post.clothingCategory.isNotBlank()) {
                     Box(
                         modifier = Modifier
@@ -358,7 +386,6 @@ fun PostCard(
 
             Spacer(modifier = Modifier.height(10.dp))
 
-            // Description / Caption Only (No bold title)
             if (post.caption.isNotBlank()) {
                 Text(
                     text = post.caption,
@@ -391,11 +418,11 @@ fun PostCard(
             }
             Spacer(modifier = Modifier.height(8.dp))
 
-            // Media Pager Box
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(300.dp)
+                    .aspectRatio(mediaRatio.coerceIn(0.5f, 2.2f))
+                    .heightIn(min = 200.dp, max = 520.dp)
                     .clip(RoundedCornerShape(12.dp))
                     .background(MaterialTheme.colorScheme.surfaceVariant),
                 contentAlignment = Alignment.Center
@@ -408,13 +435,12 @@ fun PostCard(
                         val currentMedia = imagesList[page]
                         val isVideo = isVideoMedia(context, currentMedia, post.isVideo)
 
-                        Box(
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .pointerInput(isLiked) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .pointerInput(Unit) {
                                     detectTapGestures(
                                         onTap = {
-                                            // Allow both image and video to open in full screen
                                             fullScreenInitialPage = page
                                             showFullScreenViewer = true
                                         },
@@ -436,13 +462,38 @@ fun PostCard(
                             contentAlignment = Alignment.Center
                         ) {
                             if (isVideo) {
-                                VideoPlayer(videoUrl = currentMedia)
+                                // Autoplay in feed (product decision): one ExoPlayer
+                                // per visible video. Heavy feeds may lag on low-end
+                                // devices — tap pauses via fullscreen if needed.
+                                VideoPlayer(
+                                    videoUrl = currentMedia,
+                                    autoPlay = true,
+                                    onVideoSizeChanged = { w, h ->
+                                        if (page == 0 && w > 0 && h > 0) {
+                                            mediaRatio = (w.toFloat() / h.toFloat()).coerceIn(0.5f, 2.2f)
+                                        }
+                                    }
+                                )
                             } else {
                                 AsyncImage(
-                                    model = currentMedia,
+                                    // Downsample to screen size: full-res photos decoded
+                                    // for a ~400dp box waste RAM and time; 800px is plenty.
+                                    model = coil.request.ImageRequest.Builder(context)
+                                        .data(currentMedia)
+                                        .size(800)
+                                        .crossfade(true)
+                                        .build(),
                                     contentDescription = post.clothingTitle,
                                     modifier = Modifier.fillMaxSize(),
-                                    contentScale = ContentScale.Crop
+                                    contentScale = ContentScale.Crop,
+                                    onSuccess = { state ->
+                                        if (page == 0) {
+                                            val s = state.painter.intrinsicSize
+                                            if (s.width > 0 && s.height > 0 && !s.width.isInfinite()) {
+                                                mediaRatio = (s.width / s.height).coerceIn(0.5f, 2.2f)
+                                            }
+                                        }
+                                    }
                                 )
                             }
                         }
@@ -496,63 +547,86 @@ fun PostCard(
                             }
                         }
                     }
+                } else {
+                    Text(
+                        text = "No media",
+                        color = Color.Gray,
+                        fontSize = 12.sp
+                    )
                 }
             }
 
             Spacer(modifier = Modifier.height(10.dp))
 
-            // Action Buttons Row (Contains Like, Comment, Favorite, and 3-Dots on far right)
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    IconButton(onClick = { handleLikeToggle() }) {
-                        Icon(
-                            imageVector = if (isLiked) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder,
-                            contentDescription = "Like",
-                            tint = if (isLiked) Color.Red else textColorForTheme(MidnightBlue),
-                            modifier = Modifier.size(24.dp)
-                        )
-                    }
-
-                    IconButton(
-                        onClick = {
-                            showCommentsDialog = true
-                            scope.launch {
-                                isLoadingComments = true
-                                commentsList = repository.getComments(post.id)
-                                isLoadingComments = false
-                            }
+                Row(verticalAlignment = Alignment.Top) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        IconButton(onClick = { handleLikeToggle() }) {
+                            Icon(
+                                imageVector = if (isLiked) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder,
+                                contentDescription = "Like",
+                                tint = if (isLiked) Color.Red else textColorForTheme(MidnightBlue),
+                                modifier = Modifier.size(24.dp)
+                            )
                         }
-                    ) {
-                        Icon(
-                            imageVector = Icons.Outlined.ModeComment,
-                            contentDescription = "Comment",
-                            tint = textColorForTheme(MidnightBlue),
-                            modifier = Modifier.size(24.dp)
+                        Text(
+                            text = "$likeCount",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = textColorForTheme(MidnightBlue)
                         )
                     }
 
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        modifier = Modifier.clickable { openComments() }
+                    ) {
+                        IconButton(onClick = { openComments() }) {
+                            Icon(
+                                imageVector = Icons.Outlined.ModeComment,
+                                contentDescription = "Comment",
+                                tint = textColorForTheme(MidnightBlue),
+                                modifier = Modifier.size(24.dp)
+                            )
+                        }
+                        Text(
+                            text = "$commentCount",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = textColorForTheme(MidnightBlue),
+                            modifier = Modifier.clickable { openComments() }
+                        )
+                    }
                     IconButton(onClick = {
+                        if (isSaveBusy) return@IconButton
+                        isSaveBusy = true
+                        val previousSaved = isSaved
                         val targetSaved = !isSaved
                         isSaved = targetSaved
 
                         scope.launch {
-                            repository.toggleFavourite(post.id, targetSaved)
+                            try {
+                                if (!repository.toggleFavourite(post.id, targetSaved)) {
+                                    isSaved = previousSaved
+                                }
+                            } finally {
+                                isSaveBusy = false
+                            }
                         }
                     }) {
                         Icon(
                             imageVector = if (isSaved) Icons.Filled.Bookmark else Icons.Outlined.BookmarkBorder,
                             contentDescription = "Favorite",
-                            tint = if (isSaved) MidnightBlue else textColorForTheme(MidnightBlue),
+                            tint = if (isSaved) com.example.myapplicationkoG.ui.theme.Cyan else textColorForTheme(MidnightBlue),
                             modifier = Modifier.size(24.dp)
                         )
                     }
                 }
 
-                // More Options (3 dots) moved here on the rightmost side
                 if (currentUserId == post.userId) {
                     Box {
                         IconButton(
@@ -591,20 +665,10 @@ fun PostCard(
                 }
             }
 
-            // Likes Counter
-            Text(
-                text = "$likeCount likes",
-                fontSize = 13.sp,
-                fontWeight = FontWeight.Bold,
-                color = textColorForTheme(MidnightBlue),
-                modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp)
-            )
-
             Spacer(modifier = Modifier.height(4.dp))
         }
     }
 
-    // Delete Modal
     if (showDeleteDialog) {
         AlertDialog(
             onDismissRequest = { if (!isDeleting) showDeleteDialog = false },
@@ -643,7 +707,6 @@ fun PostCard(
         )
     }
 
-    // Fullscreen Viewer (Supports Pinch-to-Zoom on both Images and Videos)
     if (showFullScreenViewer && imagesList.isNotEmpty()) {
         Dialog(
             onDismissRequest = { showFullScreenViewer = false },
@@ -701,7 +764,7 @@ fun PostCard(
                             contentAlignment = Alignment.Center
                         ) {
                             if (isVideo) {
-                                VideoPlayer(videoUrl = currentMedia)
+                                VideoPlayer(videoUrl = currentMedia, autoPlay = true)
                             } else {
                                 AsyncImage(
                                     model = currentMedia,
@@ -743,13 +806,13 @@ fun PostCard(
         }
     }
 
-    // Comments Modal
     if (showCommentsDialog) {
         Dialog(onDismissRequest = { showCommentsDialog = false }) {
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(450.dp)
+                    .fillMaxHeight(0.85f)
+                    .imePadding()
                     .clip(RoundedCornerShape(16.dp))
                     .background(MaterialTheme.colorScheme.surface)
                     .padding(16.dp)
@@ -797,7 +860,7 @@ fun PostCard(
 
                                         Spacer(modifier = Modifier.width(10.dp))
 
-                                        Column {
+                                        Column(modifier = Modifier.weight(1f)) {
                                             Text(
                                                 text = comment.username,
                                                 fontWeight = FontWeight.Bold,
@@ -825,15 +888,21 @@ fun PostCard(
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(top = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically
+                        // Top-aligned: the counter under the field would push a
+                        // centered send button out of line.
+                        verticalAlignment = Alignment.Top
                     ) {
                         OutlinedTextField(
                             value = newCommentText,
-                            onValueChange = { newCommentText = it },
+                            // 150 = TikTok comment standard; comment bubbles wrap badly when long.
+                            onValueChange = { if (it.length <= 150) newCommentText = it },
                             placeholder = { Text("Add a comment...", fontSize = 13.sp) },
                             modifier = Modifier.weight(1f),
                             shape = RoundedCornerShape(20.dp),
                             singleLine = true,
+                            supportingText = {
+                                if (newCommentText.isNotEmpty()) Text("${newCommentText.length}/150", fontSize = 11.sp)
+                            },
                             textStyle = LocalTextStyle.current.copy(
                                 color = textColorForTheme(Color.Black)
                             ),
@@ -856,6 +925,7 @@ fun PostCard(
                                     if (saved) {
                                         newCommentText = ""
                                         commentsList = repository.getComments(post.id)
+                                        commentCount = commentsList.size
                                     } else {
                                         commentError = "Could not send comment. Please try again."
                                     }
@@ -865,7 +935,7 @@ fun PostCard(
                             Icon(
                                 painter = painterResource(id = R.drawable.send),
                                 contentDescription = "Send Comment",
-                                tint = MidnightBlue,
+                                tint = textColorForTheme(MidnightBlue),
                                 modifier = Modifier.size(24.dp)
                             )
                         }

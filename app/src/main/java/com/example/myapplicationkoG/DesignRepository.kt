@@ -6,6 +6,7 @@ import io.github.jan.supabase.auth.auth
 import io.github.jan.supabase.postgrest.from
 import io.github.jan.supabase.postgrest.query.Order
 import io.github.jan.supabase.storage.storage
+import io.ktor.http.ContentType
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.SerialName
@@ -67,11 +68,15 @@ data class DesignRow(
 class DesignRepository {
 
     private val bucketName = "designs"
-    private val bucketPath = "object/public/$bucketName/"
 
     private fun urlToPath(url: String): String {
-        val idx = url.indexOf(bucketPath)
-        return if (idx >= 0) url.substring(idx + bucketPath.length) else url
+        // Robust: parse after "/designs/" instead of hard-coded "object/public/designs/"
+        // (works for public + authenticated + custom-domain URLs).
+        val marker = "/$bucketName/"
+        val idx = url.indexOf(marker)
+        if (idx >= 0) return url.substring(idx + marker.length).substringBefore("?")
+        // Fallback: last two segments (userId/file) if URL shape unknown
+        return url.substringBefore("?").split("/").takeLast(2).joinToString("/").ifBlank { url }
     }
 
     suspend fun saveDesign(
@@ -87,11 +92,11 @@ class DesignRepository {
         val bucket = supabase.storage.from(bucketName)
         val frontPath = "$userId/$id/front.png"
         val backPath = "$userId/$id/back.png"
-        bucket.upload(frontPath, frontFile.readBytes()) { upsert = true }
-        bucket.upload(backPath, backFile.readBytes()) { upsert = true }
+        bucket.upload(frontPath, frontFile.readBytes()) { upsert = true; contentType = ContentType.parse("image/png") }
+        bucket.upload(backPath, backFile.readBytes()) { upsert = true; contentType = ContentType.parse("image/png") }
         val frontUrl = bucket.publicUrl(frontPath)
         val backUrl = bucket.publicUrl(backPath)
-        val finalName = name.ifBlank { "Untitled design" }
+        val finalName = name.ifBlank { "Untitled design" }.trim().take(30)
         val state = DesignState(
             dye = dye.mapKeys { it.key.name },
             buttons = buttons.mapKeys { it.key.name },
@@ -116,11 +121,11 @@ class DesignRepository {
         val bucket = supabase.storage.from(bucketName)
         val frontPath = "$userId/$rowId/front.png"
         val backPath = "$userId/$rowId/back.png"
-        bucket.upload(frontPath, frontFile.readBytes()) { upsert = true }
-        bucket.upload(backPath, backFile.readBytes()) { upsert = true }
+        bucket.upload(frontPath, frontFile.readBytes()) { upsert = true; contentType = ContentType.parse("image/png") }
+        bucket.upload(backPath, backFile.readBytes()) { upsert = true; contentType = ContentType.parse("image/png") }
         val frontUrl = bucket.publicUrl(frontPath)
         val backUrl = bucket.publicUrl(backPath)
-        val finalName = name.ifBlank { "Untitled design" }
+        val finalName = name.ifBlank { "Untitled design" }.trim().take(30)
         val state = DesignState(
             dye = dye.mapKeys { it.key.name },
             buttons = buttons.mapKeys { it.key.name },
@@ -129,7 +134,10 @@ class DesignRepository {
         supabase.from("designs").update(
             DesignUpdate(finalName, frontUrl, backUrl, state, java.time.Instant.now().toString())
         ) {
-            filter { eq("id", rowId) }
+            filter {
+                eq("id", rowId)
+                eq("user_id", userId)
+            }
         }
         DesignRow(rowId, userId, finalName, frontUrl, backUrl, state)
     }
@@ -142,18 +150,42 @@ class DesignRepository {
         }.decodeList<DesignRow>()
     }
 
-    private suspend fun localFile(context: Context, row: DesignRow, side: String): File {
-        val dir = File(context.filesDir, "designs_cache/${row.id}").apply { mkdirs() }
-        val out = File(dir, "$side.png")
-        if (!out.exists() || out.length() == 0L) {
+    private suspend fun localFile(context: Context, row: DesignRow, side: String): File =
+        withContext(Dispatchers.IO) {
+            val dir = File(context.filesDir, "designs_cache/${row.id}").apply { mkdirs() }
+            val out = File(dir, "$side.png")
+            if (isUsableImage(out)) return@withContext out
             val remote = if (side == "front") {
                 row.frontUrl ?: error("Design has no front image")
             } else {
                 row.backUrl ?: error("Design has no back image")
             }
-            out.writeBytes(supabase.storage.from(bucketName).downloadAuthenticated(urlToPath(remote)))
+            // Download to tmp + atomic rename so an interrupted download leaves no truncated file.
+            val tmp = File(dir, "$side.png.tmp")
+            try {
+                tmp.writeBytes(supabase.storage.from(bucketName).downloadAuthenticated(urlToPath(remote)))
+                if (!isUsableImage(tmp)) error("Downloaded $side image is corrupt, please retry.")
+                if (out.exists()) out.delete()
+                if (!tmp.renameTo(out)) {
+                    tmp.copyTo(out, overwrite = true)
+                    tmp.delete()
+                }
+            } finally {
+                runCatching { if (tmp.exists()) tmp.delete() }
+            }
+            out
         }
-        return out
+
+    /** Non-empty + decodable bounds (cheap, no full decode). */
+    private fun isUsableImage(f: File): Boolean {
+        if (!f.exists() || f.length() <= 0L) return false
+        return try {
+            val o = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            android.graphics.BitmapFactory.decodeFile(f.absolutePath, o)
+            o.outWidth > 0 && o.outHeight > 0
+        } catch (_: Exception) {
+            false
+        }
     }
 
     suspend fun ensureFrontFile(context: Context, row: DesignRow): File =
@@ -163,11 +195,16 @@ class DesignRepository {
         localFile(context, row, "front") to localFile(context, row, "back")
 
     suspend fun deleteDesign(context: Context, row: DesignRow) = withContext(Dispatchers.IO) {
+        val userId = supabase.auth.currentUserOrNull()?.id ?: error("Please log in first")
+        if (row.userId.isNotBlank() && row.userId != userId) error("You can only delete your own designs.")
         val bucket = supabase.storage.from(bucketName)
         val paths = listOfNotNull(row.frontUrl, row.backUrl).map { urlToPath(it) }
         runCatching { bucket.delete(paths) }
         supabase.from("designs").delete {
-            filter { eq("id", row.id) }
+            filter {
+                eq("id", row.id)
+                eq("user_id", userId)
+            }
         }
         runCatching { File(context.filesDir, "designs_cache/${row.id}").deleteRecursively() }
     }

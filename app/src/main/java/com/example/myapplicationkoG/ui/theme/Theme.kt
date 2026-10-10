@@ -10,6 +10,7 @@ import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.platform.LocalContext
 
+/** Available theme modes. */
 enum class ThemeMode {
     SYSTEM,
     LIGHT,
@@ -28,6 +29,9 @@ private val LightColorScheme = lightColorScheme(
     tertiary = Pink40
 )
 
+/**
+ * Applies the app theme, using dynamic color on Android 12+ when enabled.
+ */
 @Composable
 fun AltThreadTheme(
     themeMode: ThemeMode = ThemeMode.SYSTEM,

@@ -1,7 +1,16 @@
 package com.example.myapplicationkoG
 
+/**
+ * Supabase AI endpoint configuration.
+ *
+ * Uses the same publishable key as the PostgREST client to avoid auth drift.
+ *
+ * Note: BuildConfig fields are not compile-time constants, hence `val` rather than `const val`.
+ */
 object AIConfig {
-    const val SUPABASE_FUNCTION_URL = "https://fqyixgfokvnvpudiruej.supabase.co/functions/v1/ai-chat"
-    const val VTON_URL = "https://fqyixgfokvnvpudiruej.supabase.co/functions/v1/vton"
-    const val SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZxeWl4Z2Zva3ZudnB1ZGlydWVqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODcyNTAxODMsImV4cCI6MjEwMjgyNjE4M30.tTE62y-iIbi9ugdJWgFFR40-EFUBQCV0mVoeZeL3gFY"
+    val SUPABASE_URL: String get() = BuildConfig.SUPABASE_URL
+    val SUPABASE_ANON_KEY: String get() = BuildConfig.SUPABASE_KEY
+    val SUPABASE_FUNCTION_URL: String get() = "${BuildConfig.SUPABASE_URL}/functions/v1/ai-chat"
+    val VTON_URL: String get() = "${BuildConfig.SUPABASE_URL}/functions/v1/vton"
+    val CUTOUT_URL: String get() = "${BuildConfig.SUPABASE_URL}/functions/v1/cutout"
 }

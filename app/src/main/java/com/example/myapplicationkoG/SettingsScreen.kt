@@ -22,12 +22,16 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.example.myapplicationkoG.ui.garmentinput.GarmentInputViewModel
 import com.example.myapplicationkoG.ui.theme.Cyan
 import com.example.myapplicationkoG.ui.theme.MidnightBlue
 import com.example.myapplicationkoG.ui.theme.ThemeMode
@@ -42,6 +46,15 @@ fun SettingsScreen(
     onLogout: () -> Unit
 ) {
     val scope = rememberCoroutineScope()
+    val context = androidx.compose.ui.platform.LocalContext.current
+    // Activity-scoped studio ViewModel: its staged garment files and drafts
+    // survive navigation, so logout must wipe them to avoid leaking one
+    // account's work into the next login on this device.
+    val activity = context as? androidx.activity.ComponentActivity
+    val garmentVm: GarmentInputViewModel? =
+        if (activity != null) viewModel(viewModelStoreOwner = activity) else null
+    var logoutError by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf<String?>(null) }
+    var isLoggingOut by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(false) }
 
     Column(
         modifier = Modifier
@@ -100,12 +113,25 @@ fun SettingsScreen(
 
         Button(
             onClick = {
+                if (isLoggingOut) return@Button
                 scope.launch {
+                    isLoggingOut = true
+                    logoutError = null
                     try {
                         supabase.auth.signOut()
+                        // Clear per-account in-memory + disk cache to avoid cross-account leaks
+                        com.example.myapplicationkoG.ShareDesignSession.clear()
+                        com.example.myapplicationkoG.ui.editor.ChallengeSession.clear()
+                        runCatching {
+                            com.example.myapplicationkoG.ui.editor.DesignSession.clear()
+                        }
+                        runCatching { garmentVm?.clearForLogout() }
                         onLogout()
                     } catch (e: Exception) {
-
+                        logoutError = e.message ?: "Logout failed. Please try again."
+                        android.widget.Toast.makeText(context, logoutError, android.widget.Toast.LENGTH_LONG).show()
+                    } finally {
+                        isLoggingOut = false
                     }
                 }
             },
@@ -118,7 +144,11 @@ fun SettingsScreen(
                 contentColor = MidnightBlue
             )
         ) {
-            Text("Log out", fontWeight = FontWeight.Bold, color = MidnightBlue, fontSize = 16.sp)
+            Text(if (isLoggingOut) "Logging out..." else "Log out", fontWeight = FontWeight.Bold, color = MidnightBlue, fontSize = 16.sp)
+        }
+        if (logoutError != null) {
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(logoutError ?: "", color = androidx.compose.ui.graphics.Color.Red, fontSize = 13.sp)
         }
     }
 }

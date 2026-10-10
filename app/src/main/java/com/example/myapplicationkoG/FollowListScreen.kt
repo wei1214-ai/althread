@@ -5,6 +5,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -34,6 +35,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
@@ -115,7 +117,10 @@ fun FollowListScreen(
                 )
             }
         } else {
-            LazyColumn {
+            LazyColumn(
+                contentPadding = PaddingValues(16.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
                 items(users, key = { it.id }) { user ->
                     Row(
                         modifier = Modifier
@@ -127,7 +132,7 @@ fun FollowListScreen(
                                     user.avatar_url ?: ""
                                 )
                             }
-                            .padding(horizontal = 16.dp, vertical = 12.dp),
+                            .padding(vertical = 12.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         AsyncImage(
@@ -142,17 +147,21 @@ fun FollowListScreen(
 
                         Spacer(modifier = Modifier.width(12.dp))
 
-                        Column {
+                        Column(modifier = Modifier.weight(1f)) {
                             Text(
                                 text = user.username ?: "User",
                                 fontWeight = FontWeight.Bold,
-                                color = textColorForTheme(MidnightBlue)
+                                color = textColorForTheme(MidnightBlue),
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
                             )
 
                             Text(
                                 text = "@${user.username ?: "user"}",
                                 color = textColorForTheme(Color.Gray),
-                                fontSize = 13.sp
+                                fontSize = 13.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
                             )
                         }
                     }
