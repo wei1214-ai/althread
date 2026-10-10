@@ -3,6 +3,7 @@ package com.example.myapplicationkoG
 import com.example.myapplicationkoG.ui.UserProfile
 import io.github.jan.supabase.auth.auth
 import io.github.jan.supabase.postgrest.from
+import io.github.jan.supabase.postgrest.query.Columns
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -138,7 +139,7 @@ class FollowRepository {
         return try {
             // Select public columns only to avoid exposing email addresses.
             supabase.from("profiles")
-                .select("id,username,bio,avatar_url") {
+                .select(columns = Columns.list("id,username,bio,avatar_url")) {
                     filter {
                         eq("id", userId)
                     }

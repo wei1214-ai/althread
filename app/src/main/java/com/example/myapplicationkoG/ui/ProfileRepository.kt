@@ -3,6 +3,7 @@ package com.example.myapplicationkoG.ui
 import com.example.myapplicationkoG.supabase
 import io.github.jan.supabase.auth.auth
 import io.github.jan.supabase.postgrest.from
+import io.github.jan.supabase.postgrest.query.Columns
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
@@ -51,7 +52,7 @@ class ProfileRepository {
             // Select public columns only to avoid exposing email addresses.
             supabase
                 .from("profiles")
-                .select("id,username,bio,avatar_url") {
+                .select(columns = Columns.list("id,username,bio,avatar_url")) {
                     filter {
                         eq("id", userId)
                     }
